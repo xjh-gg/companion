@@ -1,0 +1,9 @@
+## IDF 组件管理器依赖声明（main 组件）
+dependencies:
+  idf: ">=5.0"
+  ## esp-mqtt：IDF 不自带 mqtt 组件，需通过组件管理器从 espressif 官方仓库拉取。
+  ## 拉取后组件名（REQUIRES 中引用）为 mqtt。
+  espressif/mqtt: "^1.0.0"
+  ## esp_codec_dev：乐鑫官方音频 Codec 抽象层，统一驱动 ES8388(播放/录音)+I2S。
+  ## M5 阶段用其打通板载 ES8388 的播放/录音最小闭环，并作为后续小智固件对接的接入层。
+  espressif/esp_codec_dev: "^1.2.0"

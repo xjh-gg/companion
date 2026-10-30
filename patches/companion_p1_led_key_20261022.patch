@@ -1,0 +1,431 @@
+diff --git a/main/boards/atk-dnesp32s3/atk_dnesp32s3.cc b/main/boards/atk-dnesp32s3/atk_dnesp32s3.cc
+index c4dc3d9..8a2a03d 100644
+--- a/main/boards/atk-dnesp32s3/atk_dnesp32s3.cc
++++ b/main/boards/atk-dnesp32s3/atk_dnesp32s3.cc
+@@ -43,6 +43,17 @@ public:
+             WriteReg(0x03, data);
+         }
+     }
++
++    /* 读取 PORT1 输入寄存器；失败返回 false，避免用 0x00 误判为所有按键按下。
++     * 直接使用 I2C API 而不调用 ESP_ERROR_CHECK 版本的 ReadReg，防止瞬时
++     * I2C 错误在周期扫描中触发 abort。 */
++    bool ReadPort1(uint8_t* value) {
++        if (value == nullptr) {
++            return false;
++        }
++        uint8_t reg = 0x01;
++        return i2c_master_transmit_receive(i2c_device_, &reg, 1, value, 1, 100) == ESP_OK;
++    }
+ };
+ 
+ class atk_dnesp32s3 : public WifiBoard {
+@@ -204,6 +215,10 @@ public:
+         return &led;
+     }
+ 
++    bool GetKeyBits(uint8_t& bits) override {
++        return xl9555_ != nullptr && xl9555_->ReadPort1(&bits);
++    }
++
+     virtual AudioCodec* GetAudioCodec() override {
+         static Es8388AudioCodec audio_codec(
+             i2c_bus_, 
+diff --git a/main/boards/common/board.h b/main/boards/common/board.h
+index 935fed0..3f029c3 100644
+--- a/main/boards/common/board.h
++++ b/main/boards/common/board.h
+@@ -5,6 +5,7 @@
+ #include <web_socket.h>
+ #include <mqtt.h>
+ #include <udp.h>
++#include <cstdint>
+ #include <string>
+ #include <network_interface.h>
+ 
+@@ -40,6 +41,11 @@ public:
+     virtual std::string GetUuid() { return uuid_; }
+     virtual Backlight* GetBacklight() { return nullptr; }
+     virtual Led* GetLed();
++    /* 可选按键扩展：默认不支持；ATK DNESP32-S3 通过 XL9555 PORT1 读取 KEY0-3。 */
++    virtual bool GetKeyBits(uint8_t& bits) {
++        (void)bits;
++        return false;
++    }
+     virtual AudioCodec* GetAudioCodec() = 0;
+     virtual bool GetTemperature(float& esp32temp);
+     virtual Display* GetDisplay();
+diff --git a/main/companion/companion_led.cc b/main/companion/companion_led.cc
+index 46bc605..d8de35d 100644
+--- a/main/companion/companion_led.cc
++++ b/main/companion/companion_led.cc
+@@ -2,33 +2,95 @@
+ 
+ #include <esp_log.h>
+ 
++#include "application.h"
++#include "board.h"
++#include "device_state.h"
++
+ #define TAG "COMPANION_LED"
+ 
+-/* 当前只建立业务到 LED 的请求接口，不接管 GPIO1。
+- * 原因：XiaoZhi 板级使用 SingleLed(WS2812/RMT)，陪伴工程使用普通 GPIO LED，
+- * 实际灯珠类型尚未通过硬件资料确认；在确认前保持 XiaoZhi 原有 LED 行为。 */
++/* 仅使用 XiaoZhi 已初始化的 Led 抽象（本板为 GPIO1 WS2812 SingleLed）。
++ * 应用条件：XiaoZhi 必须处于 idle；connecting/listening/speaking 等状态由
++ * XiaoZhi 的 OnStateChanged 优先控制，避免破坏原有状态灯。 */
++static companion_led_mode_t s_last_mode = COMPANION_LED_OFF;
++static DeviceState s_last_device_state = kDeviceStateUnknown;
++
++static const char *mode_name(companion_led_mode_t mode)
++{
++    switch (mode) {
++        case COMPANION_LED_OFF:         return "off";
++        case COMPANION_LED_ON:          return "on";
++        case COMPANION_LED_BLINK_SLOW:  return "blink_slow";
++        case COMPANION_LED_BLINK_FAST:  return "blink_fast";
++        case COMPANION_LED_BLINK_ALARM: return "blink_alarm";
++        case COMPANION_LED_BREATH:      return "breath";
++        default:                        return "unknown";
++    }
++}
++
++static void apply_mode(companion_led_mode_t mode)
++{
++    Led *led = Board::GetInstance().GetLed();
++    if (led == nullptr) {
++        return;
++    }
++
++    /* 亮度沿用 XiaoZhi SingleLed 的默认等级：低 4、高 16。
++     * times=-1 持续闪烁，times=0 常亮。 */
++    switch (mode) {
++        case COMPANION_LED_OFF:
++            led->SetCompanionEffect(0, 0, 0, 0, 0);
++            break;
++        case COMPANION_LED_ON:
++            led->SetCompanionEffect(16, 0, 0, 0, 0);
++            break;
++        case COMPANION_LED_BLINK_SLOW:
++            led->SetCompanionEffect(0, 0, 4, 1000, -1);
++            break;
++        case COMPANION_LED_BLINK_FAST:
++            led->SetCompanionEffect(16, 0, 0, 200, -1);
++            break;
++        case COMPANION_LED_BLINK_ALARM:
++            led->SetCompanionEffect(16, 0, 0, 100, -1);
++            break;
++        case COMPANION_LED_BREATH:
++            /* 当前硬件为单颗 WS2812，无呼吸算法；用常亮绿色表达互动态 */
++            led->SetCompanionEffect(0, 4, 0, 0, 0);
++            break;
++        default:
++            break;
++    }
++}
++
+ void companion_led_init(void)
+ {
+-    ESP_LOGI(TAG, "LED 适配占位初始化：保持 XiaoZhi 原有 LED 行为");
++    ESP_LOGI(TAG, "陪伴 LED 适配初始化（复用 XiaoZhi Led，仅 idle 时应用）");
+ }
+ 
+ void companion_led_request(companion_led_mode_t mode)
+ {
+-    static companion_led_mode_t last_mode = COMPANION_LED_OFF;
++    s_last_mode = mode;
+ 
+-    if (mode == last_mode) {
++    if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
++        ESP_LOGI(TAG, "陪伴 LED 模式请求: %s（XiaoZhi 非 idle，暂缓）", mode_name(mode));
+         return;
+     }
+-    last_mode = mode;
+ 
+-    const char *name = "unknown";
+-    switch (mode) {
+-        case COMPANION_LED_OFF:          name = "off"; break;
+-        case COMPANION_LED_ON:           name = "on"; break;
+-        case COMPANION_LED_BLINK_SLOW:   name = "blink_slow"; break;
+-        case COMPANION_LED_BLINK_FAST:   name = "blink_fast"; break;
+-        case COMPANION_LED_BLINK_ALARM:  name = "blink_alarm"; break;
+-        case COMPANION_LED_BREATH:       name = "breath"; break;
++    apply_mode(mode);
++    ESP_LOGI(TAG, "陪伴 LED 模式已应用: %s", mode_name(mode));
++}
++
++void companion_led_tick(void)
++{
++    DeviceState current = Application::GetInstance().GetDeviceState();
++    if (current == s_last_device_state) {
++        return;
++    }
++    s_last_device_state = current;
++
++    /* XiaoZhi 每次状态变化都会调用 Led::OnStateChanged 覆盖灯效；
++     * 回到 idle 时恢复陪伴业务最近一次请求。 */
++    if (current == kDeviceStateIdle) {
++        apply_mode(s_last_mode);
++        ESP_LOGI(TAG, "XiaoZhi 回到 idle，恢复陪伴 LED 模式: %s", mode_name(s_last_mode));
+     }
+-    ESP_LOGI(TAG, "陪伴 LED 模式请求: %s（未直接驱动 GPIO1）", name);
+ }
+diff --git a/main/companion/companion_led.h b/main/companion/companion_led.h
+index 50fa970..280806c 100644
+--- a/main/companion/companion_led.h
++++ b/main/companion/companion_led.h
+@@ -6,7 +6,7 @@ extern "C" {
+ #endif
+ 
+ /* 陪伴业务希望显示的情绪模式；与陪伴工程原有语义一致。
+- * 当前实现只记录请求，不直接写 GPIO1，避免与 XiaoZhi LED 驱动冲突。 */
++ * 仅在 XiaoZhi 处于 idle 时应用，设备状态变化时由 XiaoZhi 灯效优先。 */
+ typedef enum {
+     COMPANION_LED_OFF = 0,
+     COMPANION_LED_ON,
+@@ -18,6 +18,8 @@ typedef enum {
+ 
+ void companion_led_init(void);
+ void companion_led_request(companion_led_mode_t mode);
++/* 在 XiaoZhi 回到 idle 时恢复最近一次陪伴灯效；由陪伴主任务周期调用。 */
++void companion_led_tick(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/main/companion/companion_service.cc b/main/companion/companion_service.cc
+index bcd5a61..7d126c3 100644
+--- a/main/companion/companion_service.cc
++++ b/main/companion/companion_service.cc
+@@ -12,6 +12,7 @@
+ #include <freertos/task.h>
+ 
+ #include "application.h"
++#include "board.h"
+ #include "device_state.h"
+ #include "mcp_server.h"
+ #include "wifi_station.h"
+@@ -196,6 +197,8 @@ static void companion_sensor_task(void *arg)
+     uint32_t qma_fail = 0;
+     uint32_t ap_fail = 0;
+     uint32_t ap_samples = 0;
++    uint8_t key_count = 0;
++    bool key_down = false;
+ 
+     while (true) {
+         float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+@@ -293,6 +296,23 @@ static void companion_sensor_task(void *arg)
+             }
+         }
+ 
++        /* XL9555 PORT1 bit4-7 = KEY0-3，低有效；3 拍去抖，按住只触发一次 */
++        uint8_t key_bits = 0;
++        if (Board::GetInstance().GetKeyBits(key_bits)) {
++            bool key_pressed = (key_bits & 0xF0) != 0xF0;
++            if (key_pressed) {
++                if (!key_down && ++key_count >= 3) {
++                    key_down = true;
++                    key_count = 0;
++                    ESP_LOGI(TAG, "按键按下 (XL9555 PORT1=0x%02X)", key_bits);
++                    event_queue_send(EVT_KEY_PRESSED, 0);
++                }
++            } else {
++                key_count = 0;
++                key_down = false;
++            }
++        }
++
+         {
+             std::lock_guard<std::mutex> lock(s_snapshot_mutex);
+             /* 读取失败时保留最近一次有效值，由 ap_ok/fresh 标志说明数据是否新鲜 */
+@@ -379,6 +399,7 @@ static void companion_main_task(void *arg)
+                      static_cast<unsigned>(event_queue_get_dropped_count()));
+         }
+ 
++        companion_led_tick();
+         vTaskDelay(pdMS_TO_TICKS(100));
+     }
+ }
+diff --git a/main/companion/state_machine.c b/main/companion/state_machine.c
+index aec4464..3bc962a 100644
+--- a/main/companion/state_machine.c
++++ b/main/companion/state_machine.c
+@@ -15,12 +15,19 @@ static const char *TAG = "COMPANION_STATE";
+ /* 犯困定时默认 60 分钟 */
+ #define SLEEPY_DEFAULT_MIN  60
+ 
++/* 犯困提醒重试：首次进入犯困态请求一次，之后每 30 秒重试，最多 3 次 */
++#define SLEEPY_RETRY_INTERVAL_MS 30000
++#define SLEEPY_MAX_ATTEMPTS      3
++
+ static companion_state_t s_state = STATE_IDLE;
+ static uint32_t s_sleepy_timeout_min = SLEEPY_DEFAULT_MIN;
+ static uint32_t s_state_enter_tick = 0;
+ static uint32_t s_last_activity_tick = 0;
+ static event_t s_last_event = EVT_NONE;
+ static uint32_t s_last_event_tick = 0;
++static uint32_t s_sleepy_attempts = 0;
++static uint32_t s_sleepy_next_retry_tick = 0;
++static bool s_sleepy_reminder_done = false;
+ 
+ const char *state_machine_state_name(companion_state_t s)
+ {
+@@ -81,9 +88,13 @@ static void enter_state(companion_state_t next, event_t evt)
+             break;
+         case STATE_SLEEPY:
+             companion_led_request(COMPANION_LED_BLINK_SLOW);
+-            /* 只在进入犯困态时请求一次；忙时适配层直接丢弃并记录原因 */
+-            if (!companion_audio_request_reminder()) {
+-                ESP_LOGW(TAG, "犯困提醒未受理（音频忙或设备非空闲）");
++            /* 进入犯困态先请求一次；被拒时按 30 秒间隔有限重试，避免永久丢失 */
++            s_sleepy_attempts = 1;
++            s_sleepy_reminder_done = companion_audio_request_reminder();
++            s_sleepy_next_retry_tick = now + pdMS_TO_TICKS(SLEEPY_RETRY_INTERVAL_MS);
++            if (!s_sleepy_reminder_done) {
++                ESP_LOGW(TAG, "犯困提醒未受理，将每 %d 秒重试，最多 %d 次",
++                         SLEEPY_RETRY_INTERVAL_MS / 1000, SLEEPY_MAX_ATTEMPTS);
+             }
+             break;
+         case STATE_ALARM:
+@@ -101,6 +112,11 @@ void state_machine_init(void)
+     s_last_event = EVT_NONE;
+     s_last_event_tick = now;
+     s_sleepy_timeout_min = SLEEPY_DEFAULT_MIN;
++    s_sleepy_attempts = 0;
++    s_sleepy_next_retry_tick = 0;
++    s_sleepy_reminder_done = false;
++    /* 待机默认慢闪；若 XiaoZhi 尚未 idle，适配层会先记录，待 idle 后应用 */
++    companion_led_request(COMPANION_LED_BLINK_SLOW);
+     ESP_LOGI(TAG, "状态机初始化完成，当前状态: %s", state_machine_state_name(s_state));
+ }
+ 
+@@ -211,6 +227,25 @@ void state_machine_tick(void)
+         return;
+     }
+ 
++    /* 犯困态：首次请求被拒时按固定间隔有限重试；受理后不再重复 */
++    if (s_state == STATE_SLEEPY) {
++        if (!s_sleepy_reminder_done &&
++            s_sleepy_attempts < SLEEPY_MAX_ATTEMPTS &&
++            (int32_t)(now - s_sleepy_next_retry_tick) >= 0) {
++            s_sleepy_attempts++;
++            if (companion_audio_request_reminder()) {
++                s_sleepy_reminder_done = true;
++                ESP_LOGI(TAG, "犯困提醒在第 %u 次尝试受理",
++                         (unsigned)s_sleepy_attempts);
++            } else {
++                s_sleepy_next_retry_tick = now + pdMS_TO_TICKS(SLEEPY_RETRY_INTERVAL_MS);
++                ESP_LOGW(TAG, "犯困提醒重试 %u/%u 仍未受理",
++                         (unsigned)s_sleepy_attempts, (unsigned)SLEEPY_MAX_ATTEMPTS);
++            }
++        }
++        return;
++    }
++
+     /* 报警状态暂不额外发声，避免与 XiaoZhi 音频冲突 */
+     if (s_state == STATE_ALARM) {
+         /* 预留：报警节拍由后续交互层实现 */
+diff --git a/main/led/led.h b/main/led/led.h
+index 251fd6a..3f6fe35 100644
+--- a/main/led/led.h
++++ b/main/led/led.h
+@@ -1,11 +1,20 @@
+ #ifndef _LED_H_
+ #define _LED_H_
+ 
++#include <cstdint>
++
+ class Led {
+ public:
+     virtual ~Led() = default;
+     // Set the led state based on the device state
+     virtual void OnStateChanged() = 0;
++
++    /* 陪伴业务附加灯效：times==0 常亮，times<0 持续闪烁，times>0 闪烁指定次数。
++     * 默认空实现，其他板型/NoLed 不受影响；SingleLed 在 device idle 时可被业务调用。 */
++    virtual void SetCompanionEffect(uint8_t r, uint8_t g, uint8_t b,
++                                    int interval_ms, int times) {
++        (void)r; (void)g; (void)b; (void)interval_ms; (void)times;
++    }
+ };
+ 
+ 
+diff --git a/main/led/single_led.cc b/main/led/single_led.cc
+index 338af0a..aa34fa9 100644
+--- a/main/led/single_led.cc
++++ b/main/led/single_led.cc
+@@ -116,6 +116,34 @@ void SingleLed::OnBlinkTimer() {
+ }
+ 
+ 
++void SingleLed::SetCompanionEffect(uint8_t r, uint8_t g, uint8_t b,
++                                   int interval_ms, int times) {
++    if (led_strip_ == nullptr) {
++        return;
++    }
++    if (times != 0 && interval_ms <= 0) {
++        interval_ms = 100;
++    }
++
++    std::lock_guard<std::mutex> lock(mutex_);
++    esp_timer_stop(blink_timer_);
++    r_ = r;
++    g_ = g;
++    b_ = b;
++
++    if (times == 0) {
++        /* 常亮（含黑色关闭） */
++        led_strip_set_pixel(led_strip_, 0, r_, g_, b_);
++        led_strip_refresh(led_strip_);
++        return;
++    }
++
++    /* times < 0 为持续闪烁；times > 0 为有限次数闪烁 */
++    blink_counter_ = times * 2;
++    blink_interval_ms_ = interval_ms;
++    esp_timer_start_periodic(blink_timer_, interval_ms * 1000);
++}
++
+ void SingleLed::OnStateChanged() {
+     auto& app = Application::GetInstance();
+     auto device_state = app.GetDeviceState();
+diff --git a/main/led/single_led.h b/main/led/single_led.h
+index 9bacd5a..40754e4 100644
+--- a/main/led/single_led.h
++++ b/main/led/single_led.h
+@@ -15,6 +15,8 @@ public:
+     virtual ~SingleLed();
+ 
+     void OnStateChanged() override;
++    void SetCompanionEffect(uint8_t r, uint8_t g, uint8_t b,
++                            int interval_ms, int times) override;
+ 
+ private:
+     std::mutex mutex_;
+diff --git a/tests/host/test_main.c b/tests/host/test_main.c
+index 0507181..1847ca7 100644
+--- a/tests/host/test_main.c
++++ b/tests/host/test_main.c
+@@ -187,6 +187,22 @@ static void test_state_machine(void)
+     CHECK("活动事件刷新最近活动时间", state_machine_get_last_activity_age_ms() == 0);
+     advance_ms(2500);
+     CHECK("活动时间按单调 tick 增长", state_machine_get_last_activity_age_ms() == 2500);
++
++    /* 13. 犯困提醒有限重试：首次拒绝，30s/60s 重试，受理后停止 */
++    g_reminder_accept = false;
++    reset_state(1000);
++    int rem_base = g_reminder_requests;
++    advance_seconds(3600);
++    CHECK("首次犯困提醒被拒仍进入犯困",
++          state_machine_get_state() == STATE_SLEEPY && g_reminder_requests == rem_base + 1);
++    advance_seconds(30);
++    CHECK("30s后重试第二次", g_reminder_requests == rem_base + 2);
++    g_reminder_accept = true;
++    advance_seconds(30);
++    CHECK("60s后重试受理", g_reminder_requests == rem_base + 3);
++    advance_seconds(60);
++    CHECK("受理后不再重试", g_reminder_requests == rem_base + 3);
++    g_reminder_accept = true;
+ }
+ 
+ static void test_event_queue(void)

@@ -1,0 +1,31 @@
+diff --git a/main/companion/companion_service.cc b/main/companion/companion_service.cc
+index 9bc4d6a..6673a42 100644
+--- a/main/companion/companion_service.cc
++++ b/main/companion/companion_service.cc
+@@ -345,6 +345,7 @@ static void companion_main_task(void *arg)
+     (void)arg;
+ 
+     DeviceState last_state = kDeviceStateUnknown;
++    companion_state_t last_companion_state = STATE_IDLE;
+     uint32_t tick_div = 0;
+     uint32_t heartbeat_div = 0;
+ 
+@@ -384,6 +385,18 @@ static void companion_main_task(void *arg)
+             tick_div = 0;
+             state_machine_tick();
+         }
++
++        /* EVT_TIMER_SLEEPY 由 tick 直接送入状态机，不经过事件队列；
++         * 在状态进入 SLEEPY 时补记一次历史，保证 MCP get_recent_events 可见。 */
++        companion_state_t companion_state = state_machine_get_state();
++        if (companion_state != last_companion_state) {
++            if (companion_state == STATE_SLEEPY) {
++                companion_event_log_record(EVT_TIMER_SLEEPY, now_ms,
++                                           snap.als, snap.ps, snap.ap_ok);
++            }
++            last_companion_state = companion_state;
++        }
++
+         if (++heartbeat_div >= 100) {
+             heartbeat_div = 0;
+             companion_status_t st = companion_status_get();

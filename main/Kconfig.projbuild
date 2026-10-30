@@ -1,0 +1,38 @@
+menu "Companion Network Config"
+
+    config COMPANION_WIFI_SSID
+        string "WiFi SSID"
+        default "myssid"
+        help
+            连接的家用 WiFi 名称（STA 模式）。
+            真实值请用 idf.py menuconfig 设置（不入库）。
+
+    config COMPANION_WIFI_PASSWORD
+        string "WiFi Password"
+        default "mypassword"
+        help
+            连接的家用 WiFi 密码。
+
+    config COMPANION_WIFI_CONNECT_TIMEOUT_S
+        int "WiFi connect timeout (seconds)"
+        default 20
+        range 5 60
+        help
+            network_task 每次等待 WiFi 连接的最长时间（秒）。
+            超时后本地功能不受影响，稍后重试。
+
+    config COMPANION_MQTT_BROKER_URI
+        string "MQTT Broker URI"
+        default "mqtt://192.168.137.1:1883"
+        help
+            本地 MQTT broker 地址，格式 mqtt://ip:port，
+            例如 mqtt://192.168.1.100:1883。
+
+    config COMPANION_MQTT_REPORT_PERIOD_S
+        int "MQTT status report period (seconds)"
+        default 10
+        range 1 3600
+        help
+            companion/status 主题的周期上报间隔（秒）。
+
+endmenu

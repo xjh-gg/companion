@@ -1,0 +1,462 @@
+diff --git a/main/companion/companion_led.cc b/main/companion/companion_led.cc
+index d8de35d..e60b0c6 100644
+--- a/main/companion/companion_led.cc
++++ b/main/companion/companion_led.cc
+@@ -1,5 +1,6 @@
+ #include "companion_led.h"
+ 
++#include <atomic>
+ #include <esp_log.h>
+ 
+ #include "application.h"
+@@ -8,10 +9,10 @@
+ 
+ #define TAG "COMPANION_LED"
+ 
+-/* 仅使用 XiaoZhi 已初始化的 Led 抽象（本板为 GPIO1 WS2812 SingleLed）。
++/* 仅使用 XiaoZhi 已初始化的 Led 抽象（本板为 GPIO1 普通低电平红灯 GpioLed）。
+  * 应用条件：XiaoZhi 必须处于 idle；connecting/listening/speaking 等状态由
+  * XiaoZhi 的 OnStateChanged 优先控制，避免破坏原有状态灯。 */
+-static companion_led_mode_t s_last_mode = COMPANION_LED_OFF;
++static std::atomic<int> s_last_mode{COMPANION_LED_OFF};
+ static DeviceState s_last_device_state = kDeviceStateUnknown;
+ 
+ static const char *mode_name(companion_led_mode_t mode)
+@@ -68,7 +69,7 @@ void companion_led_init(void)
+ 
+ void companion_led_request(companion_led_mode_t mode)
+ {
+-    s_last_mode = mode;
++    s_last_mode.store(static_cast<int>(mode));
+ 
+     if (Application::GetInstance().GetDeviceState() != kDeviceStateIdle) {
+         ESP_LOGI(TAG, "陪伴 LED 模式请求: %s（XiaoZhi 非 idle，暂缓）", mode_name(mode));
+@@ -90,7 +91,18 @@ void companion_led_tick(void)
+     /* XiaoZhi 每次状态变化都会调用 Led::OnStateChanged 覆盖灯效；
+      * 回到 idle 时恢复陪伴业务最近一次请求。 */
+     if (current == kDeviceStateIdle) {
+-        apply_mode(s_last_mode);
+-        ESP_LOGI(TAG, "XiaoZhi 回到 idle，恢复陪伴 LED 模式: %s", mode_name(s_last_mode));
++        companion_led_mode_t mode = static_cast<companion_led_mode_t>(s_last_mode.load());
++        apply_mode(mode);
++        ESP_LOGI(TAG, "XiaoZhi 回到 idle，恢复陪伴 LED 模式: %s", mode_name(mode));
+     }
+ }
++
++companion_led_mode_t companion_led_get_mode(void)
++{
++    return static_cast<companion_led_mode_t>(s_last_mode.load());
++}
++
++const char *companion_led_mode_name(companion_led_mode_t mode)
++{
++    return mode_name(mode);
++}
+diff --git a/main/companion/companion_led.h b/main/companion/companion_led.h
+index 280806c..b7a6c5d 100644
+--- a/main/companion/companion_led.h
++++ b/main/companion/companion_led.h
+@@ -20,6 +20,9 @@ void companion_led_init(void);
+ void companion_led_request(companion_led_mode_t mode);
+ /* 在 XiaoZhi 回到 idle 时恢复最近一次陪伴灯效；由陪伴主任务周期调用。 */
+ void companion_led_tick(void);
++/* 供 MCP/诊断读取当前请求的模式（原子读） */
++companion_led_mode_t companion_led_get_mode(void);
++const char *companion_led_mode_name(companion_led_mode_t mode);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/main/companion/companion_service.cc b/main/companion/companion_service.cc
+index 6673a42..97694e6 100644
+--- a/main/companion/companion_service.cc
++++ b/main/companion/companion_service.cc
+@@ -115,7 +115,9 @@ static cJSON *companion_service_status_json()
+         return nullptr;
+     }
+ 
+-    auto state = state_machine_get_state();
++    auto state_snapshot = state_machine_snapshot_t{};
++    state_machine_get_snapshot(&state_snapshot);
++    auto state = state_snapshot.state;
+     bool ap_fresh = snap.ap_ok && snap.ap_last_ok_us > 0 &&
+                     (now_us - snap.ap_last_ok_us) <= SENSOR_FRESH_US;
+     bool qma_fresh = snap.qma_ok && snap.qma_last_ok_us > 0 &&
+@@ -125,15 +127,15 @@ static cJSON *companion_service_status_json()
+     cJSON_AddStringToObject(json, "state", state_machine_state_name(state));
+     cJSON_AddNumberToObject(json, "state_code", static_cast<int>(state));
+     cJSON_AddNumberToObject(json, "state_duration_ms",
+-                            static_cast<double>(state_machine_get_state_duration_ms()));
++                            static_cast<double>(state_snapshot.state_duration_ms));
+     cJSON_AddNumberToObject(json, "last_activity_age_ms",
+-                            static_cast<double>(state_machine_get_last_activity_age_ms()));
++                            static_cast<double>(state_snapshot.last_activity_age_ms));
+     cJSON_AddNumberToObject(json, "sleepy_timeout_min",
+-                            static_cast<double>(state_machine_get_sleepy_timeout_min()));
++                            static_cast<double>(state_snapshot.sleepy_timeout_min));
+     cJSON_AddNumberToObject(json, "sleepy_elapsed_sec",
+-                            static_cast<double>(state_machine_get_sleepy_elapsed_sec()));
++                            static_cast<double>(state_snapshot.sleepy_elapsed_sec));
+     cJSON_AddNumberToObject(json, "sleepy_remaining_sec",
+-                            static_cast<double>(state_machine_get_sleepy_remaining_sec()));
++                            static_cast<double>(state_snapshot.sleepy_remaining_sec));
+     cJSON_AddNumberToObject(json, "als", snap.als);
+     cJSON_AddNumberToObject(json, "ps", snap.ps);
+     cJSON_AddNumberToObject(json, "gx", snap.gx);
+@@ -158,13 +160,14 @@ static cJSON *companion_service_status_json()
+                                 : -1);
+     cJSON_AddNumberToObject(json, "event_total",
+                             static_cast<double>(companion_event_log_total()));
+-    cJSON_AddBoolToObject(json, "led_available", false);
+-    cJSON_AddStringToObject(json, "led_state", "placeholder");
+-    cJSON_AddStringToObject(json, "actuator_state", "not_installed");
++    cJSON_AddBoolToObject(json, "led_available", true);
++    cJSON_AddStringToObject(json, "led_state",
++                            companion_led_mode_name(companion_led_get_mode()));
++    cJSON_AddStringToObject(json, "actuator_state", "led_only");
+     cJSON_AddStringToObject(json, "last_event",
+-                            state_machine_event_name(state_machine_get_last_event()));
++                            state_machine_event_name(state_snapshot.last_event));
+     cJSON_AddNumberToObject(json, "last_event_age_ms",
+-                            static_cast<double>(state_machine_get_last_event_age_ms()));
++                            static_cast<double>(state_snapshot.last_event_age_ms));
+     cJSON_AddBoolToObject(json, "reminder_pending", companion_audio_reminder_pending());
+     cJSON_AddBoolToObject(json, "audio_busy", companion_audio_is_busy());
+     cJSON_AddNumberToObject(json, "event_queue_dropped",
+diff --git a/main/companion/state_machine.c b/main/companion/state_machine.c
+index 3bc962a..54ba137 100644
+--- a/main/companion/state_machine.c
++++ b/main/companion/state_machine.c
+@@ -29,6 +29,18 @@ static uint32_t s_sleepy_attempts = 0;
+ static uint32_t s_sleepy_next_retry_tick = 0;
+ static bool s_sleepy_reminder_done = false;
+ 
++/* 状态机由 companion_main_task 写，MCP 回调在 Application 主循环读。
++ * 用短临界区保护字段读写，禁止在持锁期间调用 LED/音频/日志/网络。 */
++#ifdef ESP_PLATFORM
++static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
++#define SM_LOCK()   portENTER_CRITICAL(&s_state_lock)
++#define SM_UNLOCK() portEXIT_CRITICAL(&s_state_lock)
++#else
++/* 主机测试为单线程，保留同一套代码路径；真实并发同步在目标端验证 */
++#define SM_LOCK()   do {} while (0)
++#define SM_UNLOCK() do {} while (0)
++#endif
++
+ const char *state_machine_state_name(companion_state_t s)
+ {
+     static const char *name[] = { "待机", "被关注", "互动中", "犯困", "报警" };
+@@ -63,15 +75,24 @@ static bool event_is_activity(event_t e)
+ /* 进入状态：重置计时并提交 LED/提醒请求 */
+ static void enter_state(companion_state_t next, event_t evt)
+ {
+-    companion_state_t prev = s_state;
++    uint32_t now = xTaskGetTickCount();
++    uint32_t prev_tick;
++    companion_state_t prev;
++
++    SM_LOCK();
++    prev = s_state;
+     if (prev == next) {
++        SM_UNLOCK();
+         return;
+     }
+-    uint32_t now = xTaskGetTickCount();
+-    uint32_t prev_duration_ms = (uint32_t)(now - s_state_enter_tick) * portTICK_PERIOD_MS;
++    prev_tick = s_state_enter_tick;
+     s_state = next;
+     s_state_enter_tick = now;
++    SM_UNLOCK();
++
++    uint32_t prev_duration_ms = (uint32_t)(now - prev_tick) * portTICK_PERIOD_MS;
+ 
++    /* 外部动作必须在释放锁之后执行，避免长时间持锁/优先级反转 */
+     ESP_LOGI(TAG, "状态迁移: %s -> %s (事件: %s, 原状态持续 %u ms)",
+              state_machine_state_name(prev), state_machine_state_name(next),
+              state_machine_event_name(evt), (unsigned)prev_duration_ms);
+@@ -106,6 +127,7 @@ static void enter_state(companion_state_t next, event_t evt)
+ void state_machine_init(void)
+ {
+     uint32_t now = xTaskGetTickCount();
++    SM_LOCK();
+     s_state = STATE_IDLE;
+     s_state_enter_tick = now;
+     s_last_activity_tick = now;
+@@ -115,9 +137,10 @@ void state_machine_init(void)
+     s_sleepy_attempts = 0;
+     s_sleepy_next_retry_tick = 0;
+     s_sleepy_reminder_done = false;
++    SM_UNLOCK();
+     /* 待机默认慢闪；若 XiaoZhi 尚未 idle，适配层会先记录，待 idle 后应用 */
+     companion_led_request(COMPANION_LED_BLINK_SLOW);
+-    ESP_LOGI(TAG, "状态机初始化完成，当前状态: %s", state_machine_state_name(s_state));
++    ESP_LOGI(TAG, "状态机初始化完成，当前状态: %s", state_machine_state_name(STATE_IDLE));
+ }
+ 
+ void state_machine_on_event(event_t evt)
+@@ -127,13 +150,17 @@ void state_machine_on_event(event_t evt)
+     }
+ 
+     uint32_t now = xTaskGetTickCount();
++    companion_state_t state;
++    SM_LOCK();
+     s_last_event = evt;
+     s_last_event_tick = now;
+     if (event_is_activity(evt)) {
+         s_last_activity_tick = now;
+     }
++    state = s_state;
++    SM_UNLOCK();
+ 
+-    switch (s_state) {
++    switch (state) {
+         case STATE_IDLE:
+             switch (evt) {
+                 case EVT_KEY_PRESSED:
+@@ -166,7 +193,9 @@ void state_machine_on_event(event_t evt)
+                 enter_state(STATE_ALARM, evt);
+             } else if (evt == EVT_KEY_PRESSED || evt == EVT_PICKED_UP ||
+                        evt == EVT_SHAKE || evt == EVT_HAND_NEAR) {
++                SM_LOCK();
+                 s_state_enter_tick = xTaskGetTickCount();
++                SM_UNLOCK();
+             }
+             break;
+ 
+@@ -207,9 +236,18 @@ void state_machine_on_event(event_t evt)
+ void state_machine_tick(void)
+ {
+     uint32_t now = xTaskGetTickCount();
+-
+-    if (s_state == STATE_HAPPY) {
+-        if (now - s_state_enter_tick >= pdMS_TO_TICKS(HAPPY_TIMEOUT_MS)) {
++    companion_state_t state;
++    uint32_t state_tick;
++    uint32_t timeout_min;
++
++    SM_LOCK();
++    state = s_state;
++    state_tick = s_state_enter_tick;
++    timeout_min = s_sleepy_timeout_min;
++    SM_UNLOCK();
++
++    if (state == STATE_HAPPY) {
++        if (now - state_tick >= pdMS_TO_TICKS(HAPPY_TIMEOUT_MS)) {
+             ESP_LOGI(TAG, "被关注 30s 无操作，回到待机");
+             enter_state(STATE_IDLE, EVT_NONE);
+         }
+@@ -218,17 +256,17 @@ void state_machine_tick(void)
+ 
+     /* 犯困定时只在待机累计；用 tick 差值计算，避免依赖 tick() 调用频率。
+      * 集成后由 XiaoZhi 状态轮询产生 INTERACT 事件，对话期间会离开 IDLE。 */
+-    if (s_state == STATE_IDLE) {
+-        uint32_t elapsed_sec = (uint32_t)(now - s_state_enter_tick) * portTICK_PERIOD_MS / 1000;
+-        if (elapsed_sec >= s_sleepy_timeout_min * 60) {
+-            ESP_LOGI(TAG, "犯困定时到（%u 分钟）", (unsigned)s_sleepy_timeout_min);
++    if (state == STATE_IDLE) {
++        uint32_t elapsed_sec = (uint32_t)(now - state_tick) * portTICK_PERIOD_MS / 1000;
++        if (elapsed_sec >= timeout_min * 60) {
++            ESP_LOGI(TAG, "犯困定时到（%u 分钟）", (unsigned)timeout_min);
+             enter_state(STATE_SLEEPY, EVT_TIMER_SLEEPY);
+         }
+         return;
+     }
+ 
+     /* 犯困态：首次请求被拒时按固定间隔有限重试；受理后不再重复 */
+-    if (s_state == STATE_SLEEPY) {
++    if (state == STATE_SLEEPY) {
+         if (!s_sleepy_reminder_done &&
+             s_sleepy_attempts < SLEEPY_MAX_ATTEMPTS &&
+             (int32_t)(now - s_sleepy_next_retry_tick) >= 0) {
+@@ -247,14 +285,17 @@ void state_machine_tick(void)
+     }
+ 
+     /* 报警状态暂不额外发声，避免与 XiaoZhi 音频冲突 */
+-    if (s_state == STATE_ALARM) {
++    if (state == STATE_ALARM) {
+         /* 预留：报警节拍由后续交互层实现 */
+     }
+ }
+ 
+ companion_state_t state_machine_get_state(void)
+ {
+-    return s_state;
++    SM_LOCK();
++    companion_state_t s = s_state;
++    SM_UNLOCK();
++    return s;
+ }
+ 
+ void state_machine_set_sleepy_timeout_min(uint32_t min)
+@@ -262,49 +303,115 @@ void state_machine_set_sleepy_timeout_min(uint32_t min)
+     if (min == 0) {
+         return;
+     }
++    SM_LOCK();
+     s_sleepy_timeout_min = min;
++    SM_UNLOCK();
+     ESP_LOGI(TAG, "犯困定时设置为 %u 分钟", (unsigned)min);
+ }
+ 
+ uint32_t state_machine_get_sleepy_timeout_min(void)
+ {
+-    return s_sleepy_timeout_min;
++    SM_LOCK();
++    uint32_t v = s_sleepy_timeout_min;
++    SM_UNLOCK();
++    return v;
+ }
+ 
+ uint32_t state_machine_get_state_duration_ms(void)
+ {
+-    return (uint32_t)(xTaskGetTickCount() - s_state_enter_tick) * portTICK_PERIOD_MS;
++    uint32_t now = xTaskGetTickCount();
++    SM_LOCK();
++    uint32_t tick = s_state_enter_tick;
++    SM_UNLOCK();
++    return (uint32_t)(now - tick) * portTICK_PERIOD_MS;
+ }
+ 
+ uint32_t state_machine_get_last_activity_age_ms(void)
+ {
+-    return (uint32_t)(xTaskGetTickCount() - s_last_activity_tick) * portTICK_PERIOD_MS;
++    uint32_t now = xTaskGetTickCount();
++    SM_LOCK();
++    uint32_t tick = s_last_activity_tick;
++    SM_UNLOCK();
++    return (uint32_t)(now - tick) * portTICK_PERIOD_MS;
+ }
+ 
+ uint32_t state_machine_get_sleepy_elapsed_sec(void)
+ {
+-    if (s_state != STATE_IDLE) {
++    uint32_t now = xTaskGetTickCount();
++    SM_LOCK();
++    companion_state_t s = s_state;
++    uint32_t tick = s_state_enter_tick;
++    SM_UNLOCK();
++    if (s != STATE_IDLE) {
+         return 0;
+     }
+-    return (uint32_t)(xTaskGetTickCount() - s_state_enter_tick) * portTICK_PERIOD_MS / 1000;
++    return (uint32_t)(now - tick) * portTICK_PERIOD_MS / 1000;
+ }
+ 
+ uint32_t state_machine_get_sleepy_remaining_sec(void)
+ {
+-    if (s_state != STATE_IDLE) {
++    uint32_t now = xTaskGetTickCount();
++    SM_LOCK();
++    companion_state_t s = s_state;
++    uint32_t tick = s_state_enter_tick;
++    uint32_t total = s_sleepy_timeout_min * 60;
++    SM_UNLOCK();
++    if (s != STATE_IDLE) {
+         return 0;
+     }
+-    uint32_t total = s_sleepy_timeout_min * 60;
+-    uint32_t elapsed = state_machine_get_sleepy_elapsed_sec();
++    uint32_t elapsed = (uint32_t)(now - tick) * portTICK_PERIOD_MS / 1000;
+     return (elapsed >= total) ? 0 : (total - elapsed);
+ }
+ 
+ event_t state_machine_get_last_event(void)
+ {
+-    return s_last_event;
++    SM_LOCK();
++    event_t e = s_last_event;
++    SM_UNLOCK();
++    return e;
+ }
+ 
+ uint32_t state_machine_get_last_event_age_ms(void)
+ {
+-    return (uint32_t)(xTaskGetTickCount() - s_last_event_tick) * portTICK_PERIOD_MS;
++    uint32_t now = xTaskGetTickCount();
++    SM_LOCK();
++    uint32_t tick = s_last_event_tick;
++    SM_UNLOCK();
++    return (uint32_t)(now - tick) * portTICK_PERIOD_MS;
++}
++
++void state_machine_get_snapshot(state_machine_snapshot_t *out)
++{
++    if (!out) {
++        return;
++    }
++
++    uint32_t now = xTaskGetTickCount();
++    uint32_t state_tick;
++    uint32_t activity_tick;
++    uint32_t event_tick;
++
++    SM_LOCK();
++    out->state = s_state;
++    out->last_event = s_last_event;
++    out->sleepy_timeout_min = s_sleepy_timeout_min;
++    state_tick = s_state_enter_tick;
++    activity_tick = s_last_activity_tick;
++    event_tick = s_last_event_tick;
++    SM_UNLOCK();
++
++    out->state_duration_ms = (uint32_t)(now - state_tick) * portTICK_PERIOD_MS;
++    out->last_activity_age_ms = (uint32_t)(now - activity_tick) * portTICK_PERIOD_MS;
++    out->last_event_age_ms = (uint32_t)(now - event_tick) * portTICK_PERIOD_MS;
++
++    if (out->state == STATE_IDLE) {
++        out->sleepy_elapsed_sec = (uint32_t)(now - state_tick) * portTICK_PERIOD_MS / 1000;
++        uint32_t total = out->sleepy_timeout_min * 60;
++        out->sleepy_remaining_sec = (out->sleepy_elapsed_sec >= total)
++                                        ? 0
++                                        : (total - out->sleepy_elapsed_sec);
++    } else {
++        out->sleepy_elapsed_sec = 0;
++        out->sleepy_remaining_sec = 0;
++    }
+ }
+diff --git a/main/companion/state_machine.h b/main/companion/state_machine.h
+index 7ad4182..f9d790e 100644
+--- a/main/companion/state_machine.h
++++ b/main/companion/state_machine.h
+@@ -35,6 +35,20 @@ uint32_t state_machine_get_sleepy_remaining_sec(void);
+ event_t state_machine_get_last_event(void);
+ uint32_t state_machine_get_last_event_age_ms(void);
+ 
++/* 一致性快照：MCP/诊断任务一次读取全部字段，避免多次 getter 之间状态变化 */
++typedef struct {
++    companion_state_t state;
++    uint32_t state_duration_ms;
++    uint32_t last_activity_age_ms;
++    uint32_t sleepy_timeout_min;
++    uint32_t sleepy_elapsed_sec;
++    uint32_t sleepy_remaining_sec;
++    event_t last_event;
++    uint32_t last_event_age_ms;
++} state_machine_snapshot_t;
++
++void state_machine_get_snapshot(state_machine_snapshot_t *out);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/tests/host/test_main.c b/tests/host/test_main.c
+index 1847ca7..2662cdb 100644
+--- a/tests/host/test_main.c
++++ b/tests/host/test_main.c
+@@ -203,6 +203,17 @@ static void test_state_machine(void)
+     advance_seconds(60);
+     CHECK("受理后不再重试", g_reminder_requests == rem_base + 3);
+     g_reminder_accept = true;
++
++    /* 14. 状态机一致性快照：一次读取的字段应来自同一状态 */
++    reset_state(1000);
++    advance_ms(10000);
++    state_machine_snapshot_t snap;
++    state_machine_get_snapshot(&snap);
++    CHECK("快照状态为待机", snap.state == STATE_IDLE);
++    CHECK("快照超时 60 分钟", snap.sleepy_timeout_min == 60);
++    CHECK("快照状态时长 10s", snap.state_duration_ms == 10000);
++    CHECK("快照犯困已过 10s", snap.sleepy_elapsed_sec == 10);
++    CHECK("快照犯困剩余 3590s", snap.sleepy_remaining_sec == 3590);
+ }
+ 
+ static void test_event_queue(void)

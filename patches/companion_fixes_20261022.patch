@@ -1,0 +1,636 @@
+diff --git a/main/companion/motion_detect.c b/main/companion/motion_detect.c
+index c9be62a..4ec0481 100644
+--- a/main/companion/motion_detect.c
++++ b/main/companion/motion_detect.c
+@@ -108,7 +108,8 @@ motion_event_t motion_detect_update(motion_detect_t *md,
+ 
+     /* 拿起态保持：锁定期间不再重复触发 */
+     if (md->picked_up) {
+-        if (now >= md->pick_lock_tick) {
++        /* 用有符号差值比较，tick 回绕后仍能正确判断锁定期是否结束。 */
++        if ((int32_t)(now - md->pick_lock_tick) >= 0) {
+             md->picked_up = false;
+             md->z_ref_valid = false;   /* 需重新校准 */
+         }
+diff --git a/main/protocols/mqtt_protocol.cc b/main/protocols/mqtt_protocol.cc
+index 802024f..d8afe28 100644
+--- a/main/protocols/mqtt_protocol.cc
++++ b/main/protocols/mqtt_protocol.cc
+@@ -133,7 +133,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
+             on_incoming_json_(root);
+         }
+         cJSON_Delete(root);
+-        last_incoming_time_ = std::chrono::steady_clock::now();
++        UpdateLastIncomingTime();
+     });
+ 
+     ESP_LOGI(TAG, "Connecting to endpoint %s", endpoint.c_str());
+@@ -281,7 +281,7 @@ bool MqttProtocol::OpenAudioChannel() {
+         }
+     }
+ 
+-    error_occurred_ = false;
++    error_occurred_.store(false);
+     xEventGroupClearBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
+     {
+         std::lock_guard<std::mutex> aes_lock(aes_mutex_);
+@@ -412,7 +412,7 @@ bool MqttProtocol::OpenAudioChannel() {
+         if (on_incoming_audio_ != nullptr) {
+             on_incoming_audio_(std::move(packet));
+         }
+-        last_incoming_time_ = std::chrono::steady_clock::now();
++        UpdateLastIncomingTime();
+     });
+ 
+     if (!udp_->Connect(udp_server, udp_port)) {
+@@ -620,8 +620,8 @@ std::string MqttProtocol::DecodeHexString(const std::string& hex_string) {
+ }
+ 
+ bool MqttProtocol::IsAudioChannelOpened() const {
+-    /* udp_ 的创建/销毁由 channel_mutex_ 保护；error/timeout 字段仍为低风险
+-     * 无同步读取（仅 bool/时间点），不在本次最小修复范围内。 */
++    /* udp_ 的创建/销毁由 channel_mutex_ 保护；error/timeout 字段均为原子访问，
++     * 可在持锁状态下安全读取，不受网络回调任务并发更新影响。 */
+     std::lock_guard<std::mutex> lock(channel_mutex_);
+-    return udp_ != nullptr && !error_occurred_ && !IsTimeout();
++    return udp_ != nullptr && !error_occurred_.load() && !IsTimeout();
+ }
+diff --git a/main/protocols/protocol.cc b/main/protocols/protocol.cc
+index 470cc91..bc513a5 100644
+--- a/main/protocols/protocol.cc
++++ b/main/protocols/protocol.cc
+@@ -33,12 +33,18 @@ void Protocol::OnDisconnected(std::function<void()> callback) {
+ }
+ 
+ void Protocol::SetError(const std::string& message) {
+-    error_occurred_ = true;
++    error_occurred_.store(true);
+     if (on_network_error_ != nullptr) {
+         on_network_error_(message);
+     }
+ }
+ 
++void Protocol::UpdateLastIncomingTime() {
++    auto now = std::chrono::steady_clock::now();
++    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
++    last_incoming_ms_.store(static_cast<uint32_t>(ms), std::memory_order_relaxed);
++}
++
+ void Protocol::SendAbortSpeaking(AbortReason reason) {
+     std::string message = "{\"session_id\":\"" + session_id_ + "\",\"type\":\"abort\"";
+     if (reason == kAbortReasonWakeWordDetected) {
+@@ -79,12 +85,16 @@ void Protocol::SendMcpMessage(const std::string& payload) {
+ }
+ 
+ bool Protocol::IsTimeout() const {
+-    const int kTimeoutSeconds = 120;
++    const uint32_t kTimeoutMs = 120 * 1000;
+     auto now = std::chrono::steady_clock::now();
+-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - last_incoming_time_);
+-    bool timeout = duration.count() > kTimeoutSeconds;
++    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
++    uint32_t now_ms = static_cast<uint32_t>(ms);
++    uint32_t last_ms = last_incoming_ms_.load(std::memory_order_relaxed);
++    /* 32 位无符号减法：即使时间戳回绕，差值仍正确。 */
++    uint32_t elapsed_ms = now_ms - last_ms;
++    bool timeout = elapsed_ms > kTimeoutMs;
+     if (timeout) {
+-        ESP_LOGE(TAG, "Channel timeout %ld seconds", (long)duration.count());
++        ESP_LOGE(TAG, "Channel timeout %ld seconds", (long)(elapsed_ms / 1000));
+     }
+     return timeout;
+ }
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index 17ab315..3b1315c 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -2,9 +2,12 @@
+ #define PROTOCOL_H
+ 
+ #include <cJSON.h>
+-#include <string>
+-#include <functional>
++#include <atomic>
+ #include <chrono>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
+ #include <vector>
+ 
+ struct AudioStreamPacket {
+@@ -85,13 +88,18 @@ protected:
+ 
+     int server_sample_rate_ = 24000;
+     int server_frame_duration_ = 60;
+-    bool error_occurred_ = false;
++    /* 网络回调任务写、应用任务读：使用原子布尔，避免多任务无同步访问。 */
++    std::atomic<bool> error_occurred_{false};
+     std::string session_id_;
+-    std::chrono::time_point<std::chrono::steady_clock> last_incoming_time_;
++    /* 跨任务时间戳：用 32 位毫秒计数原子存储，避免 64 位时间点在 32 位
++     * 目标上被撕裂；无符号差值同时覆盖 49.7 天回绕。 */
++    std::atomic<uint32_t> last_incoming_ms_{0};
+ 
+     virtual bool SendText(const std::string& text) = 0;
+     virtual void SetError(const std::string& message);
+     virtual bool IsTimeout() const;
++    /* 记录一次服务端下行消息时间，供 IsTimeout() 判断。 */
++    void UpdateLastIncomingTime();
+ };
+ 
+ #endif // PROTOCOL_H
+diff --git a/main/protocols/websocket_protocol.cc b/main/protocols/websocket_protocol.cc
+index d4f435c..2c4b46c 100644
+--- a/main/protocols/websocket_protocol.cc
++++ b/main/protocols/websocket_protocol.cc
+@@ -72,7 +72,7 @@ bool WebsocketProtocol::SendText(const std::string& text) {
+ }
+ 
+ bool WebsocketProtocol::IsAudioChannelOpened() const {
+-    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
++    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_.load() && !IsTimeout();
+ }
+ 
+ void WebsocketProtocol::CloseAudioChannel() {
+@@ -88,7 +88,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
+         version_ = version;
+     }
+ 
+-    error_occurred_ = false;
++    error_occurred_.store(false);
+ 
+     auto network = Board::GetInstance().GetNetwork();
+     websocket_ = network->CreateWebSocket(1);
+@@ -161,7 +161,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
+             }
+             cJSON_Delete(root);
+         }
+-        last_incoming_time_ = std::chrono::steady_clock::now();
++        UpdateLastIncomingTime();
+     });
+ 
+     websocket_->OnDisconnected([this]() {
+diff --git a/managed_components/78__esp-ml307/src/esp/esp_udp.cc b/managed_components/78__esp-ml307/src/esp/esp_udp.cc
+index 9ee83bb..065759a 100644
+--- a/managed_components/78__esp-ml307/src/esp/esp_udp.cc
++++ b/managed_components/78__esp-ml307/src/esp/esp_udp.cc
+@@ -6,20 +6,18 @@
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
+ #include <netdb.h>
++#include <new>
+ 
+ static const char *TAG = "EspUdp";
+ 
+ EspUdp::EspUdp() : udp_fd_(-1) {
+-    event_group_ = xEventGroupCreate();
+ }
+ 
+ EspUdp::~EspUdp() {
+     Disconnect();
+ 
+-    if (event_group_ != nullptr) {
+-        vEventGroupDelete(event_group_);
+-        event_group_ = nullptr;
+-    }
++    /* 若接收任务未在 Disconnect() 的等待窗口内退出，其上下文会被保留，
++     * 此处不得再释放，否则任务会在已释放的事件组上置位。 */
+ }
+ 
+ bool EspUdp::Connect(const std::string& host, int port) {
+@@ -28,6 +26,11 @@ bool EspUdp::Connect(const std::string& host, int port) {
+         Disconnect();
+     }
+ 
++    if (!ReapFinishedReceiveTask()) {
++        ESP_LOGE(TAG, "Previous receive task is still exiting, refuse new connection");
++        return false;
++    }
++
+     struct sockaddr_in server_addr;
+     bzero(&server_addr, sizeof(server_addr));
+     server_addr.sin_family = AF_INET;
+@@ -54,34 +57,91 @@ bool EspUdp::Connect(const std::string& host, int port) {
+         return false;
+     }
+ 
+-    connected_ = true;
++    auto* ctx = new (std::nothrow) ReceiveTaskContext();
++    if (ctx == nullptr) {
++        ESP_LOGE(TAG, "Failed to allocate receive task context");
++        close(udp_fd_);
++        udp_fd_ = -1;
++        return false;
++    }
++    ctx->fd.store(udp_fd_);
++    /* 复制回调，接收任务不再访问 EspUdp 实例及其基类成员。 */
++    ctx->callback = message_callback_;
++    ctx->event_group = xEventGroupCreate();
++    if (ctx->event_group == nullptr) {
++        ESP_LOGE(TAG, "Failed to create receive task event group");
++        delete ctx;
++        close(udp_fd_);
++        udp_fd_ = -1;
++        return false;
++    }
+ 
+-    xEventGroupClearBits(event_group_, ESP_UDP_EVENT_RECEIVE_TASK_EXIT);
+-    xTaskCreate([](void* arg) {
+-        EspUdp* udp = (EspUdp*)arg;
+-        udp->ReceiveTask();
+-        xEventGroupSetBits(udp->event_group_, ESP_UDP_EVENT_RECEIVE_TASK_EXIT);
+-        vTaskDelete(NULL);
+-    }, "udp_receive", 4096, this, 1, &receive_task_handle_);
++    connected_ = true;
++    receive_task_ctx_ = ctx;
++    if (xTaskCreate(ReceiveTaskEntry, "udp_receive", 4096, ctx, 1, nullptr) != pdPASS) {
++        ESP_LOGE(TAG, "Failed to create receive task");
++        connected_ = false;
++        receive_task_ctx_ = nullptr;
++        vEventGroupDelete(ctx->event_group);
++        delete ctx;
++        close(udp_fd_);
++        udp_fd_ = -1;
++        return false;
++    }
+     return true;
+ }
+ 
+ void EspUdp::Disconnect() {
+     connected_ = false;
+ 
+-    if (udp_fd_ != -1) {
+-        close(udp_fd_);
+-        udp_fd_ = -1;
+-
+-        auto bits = xEventGroupWaitBits(event_group_, ESP_UDP_EVENT_RECEIVE_TASK_EXIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+-        if (!(bits & ESP_UDP_EVENT_RECEIVE_TASK_EXIT)) {
+-            ESP_LOGE(TAG, "Failed to wait for receive task exit");
++    if (receive_task_ctx_ == nullptr) {
++        if (udp_fd_ != -1) {
++            close(udp_fd_);
++            udp_fd_ = -1;
+         }
++        return;
++    }
++
++    ReceiveTaskContext* ctx = receive_task_ctx_;
++    udp_fd_ = -1;
++
++    int fd = ctx->fd.exchange(-1);
++    if (fd >= 0) {
++        shutdown(fd, SHUT_RDWR);
++        close(fd);
++    }
++
++    auto bits = xEventGroupWaitBits(ctx->event_group, ESP_UDP_EVENT_RECEIVE_TASK_EXIT,
++                                    pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
++    if (!(bits & ESP_UDP_EVENT_RECEIVE_TASK_EXIT)) {
++        /* 任务可能仍阻塞在用户回调中。此时释放事件组会导致任务返回后
++         * 在已释放内存上置位，因此保留上下文（单次有界泄漏），由下一次
++         * Connect/Disconnect/析构调用 ReapFinishedReceiveTask() 回收。 */
++        ESP_LOGE(TAG, "Receive task did not exit in 10s, keep context to avoid use-after-free");
++        return;
++    }
++
++    vEventGroupDelete(ctx->event_group);
++    delete ctx;
++    receive_task_ctx_ = nullptr;
++}
++
++bool EspUdp::ReapFinishedReceiveTask() {
++    if (receive_task_ctx_ == nullptr) {
++        return true;
++    }
++    auto bits = xEventGroupGetBits(receive_task_ctx_->event_group);
++    if (!(bits & ESP_UDP_EVENT_RECEIVE_TASK_EXIT)) {
++        return false;
+     }
++    vEventGroupDelete(receive_task_ctx_->event_group);
++    delete receive_task_ctx_;
++    receive_task_ctx_ = nullptr;
++    return true;
+ }
+ 
+ int EspUdp::Send(const std::string& data) {
+-    if (!connected_) {
++    if (!connected_ || udp_fd_ < 0) {
+         ESP_LOGE(TAG, "Not connected");
+         return -1;
+     }
+@@ -93,19 +153,25 @@ int EspUdp::Send(const std::string& data) {
+     return ret;
+ }
+ 
+-void EspUdp::ReceiveTask() {
++void EspUdp::ReceiveTaskEntry(void* arg) {
++    auto* ctx = static_cast<ReceiveTaskContext*>(arg);
+     std::string data;
+-    while (connected_) {
++    while (true) {
++        int fd = ctx->fd.load();
++        if (fd < 0) {
++            break;
++        }
+         data.resize(1500);
+-        int ret = recv(udp_fd_, data.data(), data.size(), 0);
++        int ret = recv(fd, data.data(), data.size(), 0);
+         if (ret <= 0) {
+-            connected_ = false;
+             break;
+         }
+-        
+-        if (message_callback_) {
++
++        if (ctx->callback) {
+             data.resize(ret);
+-            message_callback_(data);
++            ctx->callback(data);
+         }
+     }
++    xEventGroupSetBits(ctx->event_group, ESP_UDP_EVENT_RECEIVE_TASK_EXIT);
++    vTaskDelete(NULL);
+ }
+diff --git a/managed_components/78__esp-ml307/src/esp/esp_udp.h b/managed_components/78__esp-ml307/src/esp/esp_udp.h
+index 0d55754..f535ed0 100644
+--- a/managed_components/78__esp-ml307/src/esp/esp_udp.h
++++ b/managed_components/78__esp-ml307/src/esp/esp_udp.h
+@@ -3,6 +3,9 @@
+ 
+ #include "udp.h"
+ 
++#include <atomic>
++#include <functional>
++
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/event_groups.h>
+ #include <freertos/task.h>
+@@ -19,11 +22,19 @@ public:
+     int Send(const std::string& data) override;
+ 
+ private:
+-    int udp_fd_;
+-    EventGroupHandle_t event_group_ = nullptr;
+-    TaskHandle_t receive_task_handle_ = nullptr;
+-
+-    void ReceiveTask();
++    /* 接收任务只持有本结构，不访问 EspUdp 实例。
++     * 这样即使任务因用户回调阻塞而晚于对象析构退出，也不会发生释放后使用。 */
++    struct ReceiveTaskContext {
++        std::atomic<int> fd{-1};
++        EventGroupHandle_t event_group = nullptr;
++        std::function<void(const std::string& data)> callback;
++    };
++
++    static void ReceiveTaskEntry(void* arg);
++    bool ReapFinishedReceiveTask();
++
++    int udp_fd_ = -1;
++    ReceiveTaskContext* receive_task_ctx_ = nullptr;
+ };
+ 
+ #endif // ESP_UDP_H
+diff --git a/tests/host/run_tests.ps1 b/tests/host/run_tests.ps1
+index a2302d5..165de8a 100644
+--- a/tests/host/run_tests.ps1
++++ b/tests/host/run_tests.ps1
+@@ -13,7 +13,9 @@ foreach ($f in @(
+     (Join-Path $companion 'state_machine.h'),
+     (Join-Path $companion 'event_queue.h'),
+     (Join-Path $companion 'companion_audio.h'),
+-    (Join-Path $companion 'companion_led.h')
++    (Join-Path $companion 'companion_led.h'),
++    (Join-Path $companion 'motion_detect.c'),
++    (Join-Path $companion 'motion_detect.h')
+ )) {
+     if (-not (Test-Path $f)) {
+         throw "缺少被测源码或头文件: $f"
+@@ -27,6 +29,7 @@ $out = Join-Path $here 'host_tests.exe'
+     (Join-Path $companion 'event_queue.c') `
+     (Join-Path $companion 'companion_event_log.c') `
+     (Join-Path $companion 'state_machine.c') `
++    (Join-Path $companion 'motion_detect.c') `
+     (Join-Path $here 'test_main.c') `
+     -o $out
+ 
+@@ -35,4 +38,24 @@ if ($LASTEXITCODE -ne 0) {
+ }
+ 
+ & $out
+-exit $LASTEXITCODE
++$c_result = $LASTEXITCODE
++
++$protocolDir = Join-Path $SourceRoot 'main\protocols'
++$out_cpp = Join-Path $here 'host_protocol_tests.exe'
++& g++ -std=gnu++17 -Wall -Wextra -Werror `
++    -I (Join-Path $here 'stubs') -I $protocolDir `
++    (Join-Path $protocolDir 'protocol.cc') `
++    (Join-Path $here 'test_protocol.cc') `
++    -o $out_cpp
++
++if ($LASTEXITCODE -ne 0) {
++    throw "协议主机测试编译失败，退出码 $LASTEXITCODE"
++}
++
++& $out_cpp
++$cpp_result = $LASTEXITCODE
++
++if ($c_result -ne 0 -or $cpp_result -ne 0) {
++    exit 1
++}
++exit 0
+diff --git a/tests/host/stubs/cJSON.h b/tests/host/stubs/cJSON.h
+new file mode 100644
+index 0000000..79457be
+--- /dev/null
++++ b/tests/host/stubs/cJSON.h
+@@ -0,0 +1,7 @@
++#ifndef STUB_CJSON_H
++#define STUB_CJSON_H
++
++/* 主机侧仅测试 Protocol 的原子时间戳/错误标志，不需要 cJSON 实现。 */
++typedef struct cJSON cJSON;
++
++#endif
+diff --git a/tests/host/test_main.c b/tests/host/test_main.c
+index 2da9645..0507181 100644
+--- a/tests/host/test_main.c
++++ b/tests/host/test_main.c
+@@ -12,6 +12,7 @@
+ #include "companion_event_log.h"
+ #include "companion_led.h"
+ #include "event_queue.h"
++#include "motion_detect.h"
+ #include "state_machine.h"
+ 
+ /* ---- 虚拟时钟与副作用记录 ---- */
+@@ -257,6 +258,84 @@ static void test_event_log(void)
+     n = companion_event_log_copy(rec, 1);
+     CHECK("无效数据标志被保留", n == 1 && rec[0].valid == false);
+     CHECK("事件类型正确", rec[0].type == EVT_DARK && rec[0].als == 42);
++
++    CHECK("复制0条返回0", companion_event_log_copy(rec, 0) == 0);
++    CHECK("空指针复制返回0", companion_event_log_copy(NULL, 5) == 0);
++    n = companion_event_log_copy(rec, COMPANION_EVENT_LOG_CAP + 1);
++    CHECK("复制请求超过容量按24条截断", n == COMPANION_EVENT_LOG_CAP);
++    bool strictly_descending = true;
++    for (uint32_t i = 1; i < n; i++) {
++        if (rec[i].seq >= rec[i - 1].seq) {
++            strictly_descending = false;
++            break;
++        }
++    }
++    CHECK("事件按序号严格倒序返回", strictly_descending);
++}
++
++static motion_event_t feed_motion(motion_detect_t *md, float x, float y, float z)
++{
++    advance_ms(50);
++    return motion_detect_update(md, x, y, z);
++}
++
++static void test_motion_detect(void)
++{
++    /* 拿起与锁定解除 */
++    g_tick = 1000;
++    motion_detect_t *md = motion_detect_create();
++    CHECK("运动检测器创建成功", md != NULL);
++    motion_event_t ev = MOTION_NONE;
++    for (int i = 0; i < 5; i++) {
++        ev = feed_motion(md, 0.0f, 0.0f, 1.0f);
++    }
++    CHECK("静止校准期间不误报", ev == MOTION_NONE);
++    ev = feed_motion(md, 0.0f, 0.0f, 0.1f);
++    CHECK("z分量骤减触发拿起", ev == MOTION_PICK_UP);
++    ev = feed_motion(md, 0.0f, 0.0f, 0.1f);
++    CHECK("拿起锁定期间不重复触发", ev == MOTION_NONE);
++
++    advance_ms(350); /* 累计满 400ms 锁定 */
++    ev = motion_detect_update(md, 0.0f, 0.0f, 1.0f);
++    CHECK("锁定期满后不再重复上报", ev == MOTION_NONE);
++    for (int i = 0; i < 5; i++) {
++        feed_motion(md, 0.0f, 0.0f, 1.0f);
++    }
++    ev = feed_motion(md, 0.0f, 0.0f, 0.1f);
++    CHECK("重新校准后可再次拿起", ev == MOTION_PICK_UP);
++    motion_detect_destroy(md);
++
++    /* 摇晃：1 秒窗口内方向翻转达到阈值 */
++    g_tick = 1000;
++    md = motion_detect_create();
++    bool shake = false;
++    for (int i = 0; i < 30; i++) {
++        ev = feed_motion(md, (i % 2) ? 2.0f : -2.0f, 0.0f, 0.0f);
++        if (ev == MOTION_SHAKE) {
++            shake = true;
++            break;
++        }
++    }
++    CHECK("方向反复翻转触发摇晃", shake);
++    motion_detect_destroy(md);
++
++    /* tick 回绕：锁定截止点未回绕、观察点已回绕时仍能解锁 */
++    g_tick = 0xFFFFFD00u;
++    md = motion_detect_create();
++    for (int i = 0; i < 5; i++) {
++        feed_motion(md, 0.0f, 0.0f, 1.0f);
++    }
++    ev = feed_motion(md, 0.0f, 0.0f, 0.1f);
++    CHECK("回绕前拿起正常触发", ev == MOTION_PICK_UP);
++    advance_ms(500); /* 跨过 32 位 tick 边界，期间不更新 */
++    ev = motion_detect_update(md, 0.0f, 0.0f, 0.1f);
++    CHECK("回绕后锁定期正确结束", ev == MOTION_NONE);
++    for (int i = 0; i < 5; i++) {
++        feed_motion(md, 0.0f, 0.0f, 1.0f);
++    }
++    ev = feed_motion(md, 0.0f, 0.0f, 0.1f);
++    CHECK("回绕后可重新校准并触发拿起", ev == MOTION_PICK_UP);
++    motion_detect_destroy(md);
+ }
+ 
+ int main(void)
+@@ -267,6 +346,8 @@ int main(void)
+     test_event_queue();
+     printf("=== event log tests ===\n");
+     test_event_log();
++    printf("=== motion detect tests ===\n");
++    test_motion_detect();
+ 
+     printf("\nRESULT: PASS=%d FAIL=%d\n", g_pass, g_fail);
+     return (g_fail == 0) ? 0 : 1;
+diff --git a/tests/host/test_protocol.cc b/tests/host/test_protocol.cc
+new file mode 100644
+index 0000000..2e034d2
+--- /dev/null
++++ b/tests/host/test_protocol.cc
+@@ -0,0 +1,69 @@
++/* 主机侧单元测试：直接编译真实的 protocol.cc，
++ * 仅替换日志与 cJSON 类型声明，验证超时与错误标志的原子访问语义。 */
++#include <chrono>
++#include <cstdio>
++#include <memory>
++#include <string>
++
++#include "protocol.h"
++
++static int g_pass = 0;
++static int g_fail = 0;
++
++#define CHECK(name, cond)                                    \
++    do {                                                     \
++        if (cond) {                                          \
++            g_pass++;                                        \
++            printf("PASS %s\n", name);                       \
++        } else {                                             \
++            g_fail++;                                        \
++            printf("FAIL %s\n", name);                       \
++        }                                                    \
++    } while (0)
++
++class TestProtocol : public Protocol {
++public:
++    bool Start() override { return true; }
++    bool OpenAudioChannel() override { return true; }
++    void CloseAudioChannel() override {}
++    bool IsAudioChannelOpened() const override { return true; }
++    bool SendAudio(std::unique_ptr<AudioStreamPacket>) override { return true; }
++
++    using Protocol::IsTimeout;
++    using Protocol::SetError;
++    using Protocol::UpdateLastIncomingTime;
++
++    bool ErrorFlag() const { return error_occurred_.load(); }
++    void SetLastMs(uint32_t ms) { last_incoming_ms_.store(ms); }
++
++protected:
++    bool SendText(const std::string&) override { return true; }
++};
++
++static uint32_t NowMs()
++{
++    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    return static_cast<uint32_t>(ms);
++}
++
++int main(void)
++{
++    TestProtocol protocol;
++
++    CHECK("初始无错误标志", !protocol.ErrorFlag());
++    protocol.SetError("test");
++    CHECK("SetError 置位错误标志", protocol.ErrorFlag());
++
++    uint32_t now = NowMs();
++    protocol.SetLastMs(now - 60000);
++    CHECK("最近 60s 有下行消息不超时", !protocol.IsTimeout());
++    protocol.SetLastMs(now - 121000);
++    CHECK("121s 无下行消息判定超时", protocol.IsTimeout());
++
++    protocol.UpdateLastIncomingTime();
++    CHECK("更新时间后立即恢复不超时", !protocol.IsTimeout());
++
++    printf("\nRESULT: PASS=%d FAIL=%d\n", g_pass, g_fail);
++    return (g_fail == 0) ? 0 : 1;
++}

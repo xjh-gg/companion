@@ -1,0 +1,823 @@
+diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
+index 8188870..7ad29bc 100644
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -37,6 +37,8 @@ set(SOURCES "audio/audio_codec.cc"
+             "companion/companion_service.cc"
+             "companion/companion_audio.cc"
+             "companion/companion_led.cc"
++            "companion/companion_mqtt.cc"
++            "companion/companion_mqtt_codec.c"
+             "companion/companion_i2c.c"
+             "companion/newlib_ctype_shim.c"
+             "companion/event_queue.c"
+diff --git a/main/companion/companion_mqtt.cc b/main/companion/companion_mqtt.cc
+new file mode 100644
+index 0000000..7e36203
+--- /dev/null
++++ b/main/companion/companion_mqtt.cc
+@@ -0,0 +1,377 @@
++#include "companion_mqtt.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <string>
++
++#include <cJSON.h>
++#include <esp_log.h>
++#include <esp_mac.h>
++#include <esp_timer.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/queue.h>
++#include <freertos/task.h>
++
++#include "companion_audio.h"
++#include "companion_mqtt_codec.h"
++#include "companion_mqtt_transport.h"
++#include "settings.h"
++#include "state_machine.h"
++#include "wifi_station.h"
++
++#define TAG "COMPANION_MQTT"
++
++#define OUT_QUEUE_LEN       16
++#define CMD_QUEUE_LEN       4
++#define OUT_TOPIC_MAX       96
++#define OUT_PAYLOAD_MAX     768
++#define CMD_ID_MAX          64
++#define SEEN_ID_COUNT       8
++
++struct OutMsg {
++    char topic[OUT_TOPIC_MAX];
++    char payload[OUT_PAYLOAD_MAX];
++};
++
++static QueueHandle_t s_out_queue = nullptr;
++static QueueHandle_t s_cmd_queue = nullptr;
++static TaskHandle_t s_task = nullptr;
++static std::atomic<bool> s_inited{false};
++static std::atomic<bool> s_connected{false};
++static std::atomic<uint32_t> s_sequence{0};
++static std::atomic<uint32_t> s_dropped{0};
++
++static std::string s_device_id;
++static std::string s_event_topic;
++static std::string s_status_topic;
++static std::string s_command_topic;
++static uint32_t s_status_period_ms = 10000;
++static uint32_t s_last_status_ms = 0;
++
++static std::mutex s_seen_mutex;
++static char s_seen_ids[SEEN_ID_COUNT][CMD_ID_MAX + 1] = {};
++static size_t s_seen_next = 0;
++
++static const char *event_code(event_t evt)
++{
++    switch (evt) {
++        case EVT_KEY_PRESSED:    return "key";
++        case EVT_PICKED_UP:      return "pickup";
++        case EVT_SHAKE:          return "shake";
++        case EVT_HAND_NEAR:      return "hand_near";
++        case EVT_DARK:           return "dark";
++        case EVT_TIMER_SLEEPY:   return "timer_sleepy";
++        case EVT_ALARM:          return "alarm";
++        case EVT_INTERACT_START: return "interact_start";
++        case EVT_INTERACT_END:   return "interact_end";
++        case EVT_BRIGHT:         return "bright";
++        default:                 return "none";
++    }
++}
++
++static void enqueue_out(const char *topic, const char *payload)
++{
++    if (!s_inited.load() || topic == nullptr || payload == nullptr) {
++        return;
++    }
++    if (strlen(payload) >= OUT_PAYLOAD_MAX) {
++        ESP_LOGW(TAG, "上报消息过长，丢弃: %u bytes", (unsigned)strlen(payload));
++        return;
++    }
++
++    OutMsg msg = {};
++    snprintf(msg.topic, sizeof(msg.topic), "%s", topic);
++    snprintf(msg.payload, sizeof(msg.payload), "%s", payload);
++
++    if (xQueueSend(s_out_queue, &msg, 0) != pdPASS) {
++        uint32_t drops = s_dropped.fetch_add(1) + 1;
++        if (drops == 1 || (drops % 20) == 0) {
++            ESP_LOGW(TAG, "MQTT 发送队列满，累计丢弃 %u", (unsigned)drops);
++        }
++    }
++}
++
++static void enqueue_json(const char *topic, cJSON *root)
++{
++    if (root == nullptr) {
++        return;
++    }
++    char *text = cJSON_PrintUnformatted(root);
++    cJSON_Delete(root);
++    if (text == nullptr) {
++        return;
++    }
++    enqueue_out(topic, text);
++    cJSON_free(text);
++}
++
++static void publish_status(uint32_t uptime_ms, const companion_mqtt_sensor_view_t *view)
++{
++    if (s_status_topic.empty()) {
++        return;
++    }
++
++    state_machine_snapshot_t snapshot = {};
++    state_machine_get_snapshot(&snapshot);
++
++    cJSON *root = cJSON_CreateObject();
++    if (root == nullptr) {
++        return;
++    }
++
++    cJSON_AddNumberToObject(root, "schema_version", 1);
++    cJSON_AddStringToObject(root, "device_id", s_device_id.c_str());
++    cJSON_AddStringToObject(root, "message_type", "status");
++    cJSON_AddNumberToObject(root, "timestamp", uptime_ms);
++    cJSON_AddStringToObject(root, "timestamp_type", "uptime_ms");
++    cJSON_AddNumberToObject(root, "sequence", s_sequence.fetch_add(1) + 1);
++    cJSON_AddStringToObject(root, "state", state_machine_state_name(snapshot.state));
++    cJSON_AddNumberToObject(root, "state_code", static_cast<int>(snapshot.state));
++
++    cJSON *sensors = cJSON_AddObjectToObject(root, "sensors");
++    if (sensors != nullptr) {
++        cJSON_AddNumberToObject(sensors, "als", view ? view->als : 0);
++        cJSON_AddNumberToObject(sensors, "ps", view ? view->ps : 0);
++        cJSON_AddNumberToObject(sensors, "gx", view ? view->gx : 0.0f);
++        cJSON_AddNumberToObject(sensors, "gy", view ? view->gy : 0.0f);
++        cJSON_AddNumberToObject(sensors, "gz", view ? view->gz : 0.0f);
++        cJSON_AddBoolToObject(sensors, "ap_ok", view ? view->ap_ok : false);
++        cJSON_AddBoolToObject(sensors, "qma_ok", view ? view->qma_ok : false);
++        cJSON_AddBoolToObject(sensors, "dark", view ? view->dark : false);
++    }
++
++    cJSON_AddStringToObject(root, "last_event",
++                            state_machine_event_name(snapshot.last_event));
++    cJSON_AddNumberToObject(root, "last_event_age_ms", snapshot.last_event_age_ms);
++    cJSON_AddNumberToObject(root, "sleepy_remaining_sec",
++                            snapshot.sleepy_remaining_sec);
++    cJSON_AddBoolToObject(root, "wifi_connected",
++                          WifiStation::GetInstance().IsConnected());
++    cJSON_AddBoolToObject(root, "mqtt_connected", s_connected.load());
++
++    enqueue_json(s_status_topic.c_str(), root);
++}
++
++static bool seen_command_id(const char *command_id)
++{
++    std::lock_guard<std::mutex> lock(s_seen_mutex);
++    for (size_t i = 0; i < SEEN_ID_COUNT; i++) {
++        if (s_seen_ids[i][0] != '\0' && strcmp(s_seen_ids[i], command_id) == 0) {
++            return true;
++        }
++    }
++    snprintf(s_seen_ids[s_seen_next], sizeof(s_seen_ids[s_seen_next]), "%s", command_id);
++    s_seen_next = (s_seen_next + 1) % SEEN_ID_COUNT;
++    return false;
++}
++
++static void process_commands(uint32_t uptime_ms,
++                             const companion_mqtt_sensor_view_t *view)
++{
++    if (s_cmd_queue == nullptr) {
++        return;
++    }
++
++    companion_mqtt_cmd_t cmd = {};
++    while (xQueueReceive(s_cmd_queue, &cmd, 0) == pdPASS) {
++        uint32_t age = uptime_ms - cmd.received_ms;
++        if (age > cmd.ttl_ms) {
++            ESP_LOGW(TAG, "命令已过期: id=%s age=%u ttl=%u",
++                     cmd.command_id, (unsigned)age, (unsigned)cmd.ttl_ms);
++            continue;
++        }
++
++        const char *result = "rejected";
++        if (strcmp(cmd.action, "request_status") == 0) {
++            publish_status(uptime_ms, view);
++            result = "accepted";
++        } else if (strcmp(cmd.action, "play_chime") == 0) {
++            result = companion_audio_request_reminder() ? "accepted" : "audio_busy";
++        } else if (strcmp(cmd.action, "noop") == 0) {
++            result = "accepted";
++        }
++
++        ESP_LOGI(TAG, "云端命令: id=%s intent=%s action=%s result=%s",
++                 cmd.command_id, cmd.intent, cmd.action, result);
++    }
++}
++
++static void mqtt_task(void *arg)
++{
++    (void)arg;
++    OutMsg msg = {};
++
++    while (true) {
++        if (xQueuePeek(s_out_queue, &msg, portMAX_DELAY) != pdPASS) {
++            continue;
++        }
++        if (!s_connected.load()) {
++            vTaskDelay(pdMS_TO_TICKS(500));
++            continue;
++        }
++        if (companion_mqtt_transport_publish(msg.topic, msg.payload, 1)) {
++            xQueueReceive(s_out_queue, &msg, 0);
++            /* 重连后平滑补发，避免瞬间占满 broker/网络 */
++            vTaskDelay(pdMS_TO_TICKS(20));
++        } else {
++            vTaskDelay(pdMS_TO_TICKS(1000));
++        }
++    }
++}
++
++extern "C" void companion_mqtt_init(void)
++{
++    if (s_inited.load()) {
++        return;
++    }
++
++    Settings settings("mqtt", false);
++    s_device_id = settings.GetString("device_id");
++    if (s_device_id.empty()) {
++        s_device_id = settings.GetString("client_id");
++    }
++    if (s_device_id.empty()) {
++        uint8_t mac[6] = {};
++        if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
++            char fallback[32] = {};
++            snprintf(fallback, sizeof(fallback), "esp32s3-%02x%02x%02x",
++                     mac[3], mac[4], mac[5]);
++            s_device_id = fallback;
++        }
++    }
++    if (s_device_id.empty()) {
++        ESP_LOGW(TAG, "缺少 device_id/client_id，MQTT 业务上报禁用");
++        return;
++    }
++
++    s_event_topic = settings.GetString("companion_event_topic",
++                                       "companion/" + s_device_id + "/event");
++    s_status_topic = settings.GetString("companion_status_topic",
++                                        "companion/" + s_device_id + "/status");
++    s_command_topic = settings.GetString("companion_command_topic",
++                                         "companion/" + s_device_id + "/command");
++
++    int32_t period_s = settings.GetInt("companion_status_period_s", 10);
++    if (period_s < 5) {
++        period_s = 5;
++    } else if (period_s > 60) {
++        period_s = 60;
++    }
++    s_status_period_ms = static_cast<uint32_t>(period_s) * 1000;
++
++    s_out_queue = xQueueCreate(OUT_QUEUE_LEN, sizeof(OutMsg));
++    s_cmd_queue = xQueueCreate(CMD_QUEUE_LEN, sizeof(companion_mqtt_cmd_t));
++    if (s_out_queue == nullptr || s_cmd_queue == nullptr) {
++        ESP_LOGE(TAG, "创建 MQTT 业务队列失败");
++        return;
++    }
++    if (xTaskCreate(mqtt_task, "companion_mqtt", 4096, nullptr, 1, &s_task) != pdPASS) {
++        ESP_LOGE(TAG, "创建 MQTT 业务任务失败");
++        return;
++    }
++
++    s_inited.store(true);
++    ESP_LOGI(TAG, "业务上报就绪: device=%s event=%s status=%s command=%s period=%us",
++             s_device_id.c_str(), s_event_topic.c_str(), s_status_topic.c_str(),
++             s_command_topic.c_str(), (unsigned)period_s);
++}
++
++extern "C" void companion_mqtt_on_connected(void)
++{
++    s_connected.store(true);
++    if (!s_command_topic.empty() &&
++        companion_mqtt_transport_subscribe(s_command_topic.c_str(), 1)) {
++        ESP_LOGI(TAG, "已订阅云端命令主题: %s", s_command_topic.c_str());
++    } else {
++        ESP_LOGW(TAG, "云端命令主题订阅失败或未配置");
++    }
++}
++
++extern "C" void companion_mqtt_on_disconnected(void)
++{
++    s_connected.store(false);
++}
++
++extern "C" bool companion_mqtt_on_message(const char *topic, const char *payload)
++{
++    if (s_command_topic.empty() || topic == nullptr ||
++        s_command_topic != topic) {
++        return false;
++    }
++
++    companion_mqtt_cmd_t cmd = {};
++    char reason[48] = {};
++    uint32_t received_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
++    if (!companion_mqtt_parse_command(payload, s_device_id.c_str(),
++                                      received_ms, &cmd,
++                                      reason, sizeof(reason))) {
++        ESP_LOGW(TAG, "命令校验失败: %s", reason);
++        return true;  /* 已识别为业务主题，但校验失败，禁止落入 XiaoZhi 解析 */
++    }
++    if (seen_command_id(cmd.command_id)) {
++        ESP_LOGW(TAG, "重复命令已忽略: id=%s", cmd.command_id);
++        return true;
++    }
++    if (xQueueSend(s_cmd_queue, &cmd, 0) != pdPASS) {
++        ESP_LOGW(TAG, "命令队列满，拒绝: id=%s", cmd.command_id);
++    }
++    return true;
++}
++
++extern "C" void companion_mqtt_publish_event(event_t evt, uint32_t uptime_ms,
++                                              const companion_mqtt_sensor_view_t *view)
++{
++    if (!s_inited.load() || s_event_topic.empty() || evt == EVT_NONE) {
++        return;
++    }
++
++    state_machine_snapshot_t snapshot = {};
++    state_machine_get_snapshot(&snapshot);
++
++    cJSON *root = cJSON_CreateObject();
++    if (root == nullptr) {
++        return;
++    }
++
++    cJSON_AddNumberToObject(root, "schema_version", 1);
++    cJSON_AddStringToObject(root, "device_id", s_device_id.c_str());
++    cJSON_AddStringToObject(root, "message_type", "event");
++    cJSON_AddStringToObject(root, "event_type", event_code(evt));
++    cJSON_AddNumberToObject(root, "timestamp", uptime_ms);
++    cJSON_AddStringToObject(root, "timestamp_type", "uptime_ms");
++    cJSON_AddNumberToObject(root, "sequence", s_sequence.fetch_add(1) + 1);
++
++    cJSON *data = cJSON_AddObjectToObject(root, "data");
++    if (data != nullptr) {
++        cJSON_AddStringToObject(data, "state",
++                                state_machine_state_name(snapshot.state));
++        cJSON_AddNumberToObject(data, "als", view ? view->als : 0);
++        cJSON_AddNumberToObject(data, "ps", view ? view->ps : 0);
++        cJSON_AddBoolToObject(data, "ap_ok", view ? view->ap_ok : false);
++        cJSON_AddBoolToObject(data, "qma_ok", view ? view->qma_ok : false);
++        cJSON_AddBoolToObject(data, "dark", view ? view->dark : false);
++    }
++
++    enqueue_json(s_event_topic.c_str(), root);
++}
++
++extern "C" void companion_mqtt_tick(uint32_t uptime_ms,
++                                     const companion_mqtt_sensor_view_t *view)
++{
++    if (!s_inited.load()) {
++        return;
++    }
++
++    process_commands(uptime_ms, view);
++
++    if (s_status_topic.empty()) {
++        return;
++    }
++    if (s_last_status_ms == 0 ||
++        (uint32_t)(uptime_ms - s_last_status_ms) >= s_status_period_ms) {
++        s_last_status_ms = uptime_ms;
++        publish_status(uptime_ms, view);
++    }
++}
+diff --git a/main/companion/companion_mqtt.h b/main/companion/companion_mqtt.h
+new file mode 100644
+index 0000000..005b828
+--- /dev/null
++++ b/main/companion/companion_mqtt.h
+@@ -0,0 +1,43 @@
++#ifndef COMPANION_MQTT_H
++#define COMPANION_MQTT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "event_queue.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* 由 companion_service 提供的传感器视图；无效数据保留最近值但 valid=false。 */
++typedef struct {
++    uint16_t als;
++    uint16_t ps;
++    float gx;
++    float gy;
++    float gz;
++    bool ap_ok;
++    bool qma_ok;
++    bool dark;
++} companion_mqtt_sensor_view_t;
++
++void companion_mqtt_init(void);
++
++/* MqttProtocol 连接生命周期回调 */
++void companion_mqtt_on_connected(void);
++void companion_mqtt_on_disconnected(void);
++/* 返回 true 表示该消息已被业务层处理，不再交给 XiaoZhi 协议解析。 */
++bool companion_mqtt_on_message(const char *topic, const char *payload);
++
++/* 主任务调用：事件即时入队；tick 负责低频状态与命令执行。 */
++void companion_mqtt_publish_event(event_t evt, uint32_t uptime_ms,
++                                  const companion_mqtt_sensor_view_t *view);
++void companion_mqtt_tick(uint32_t uptime_ms,
++                         const companion_mqtt_sensor_view_t *view);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* COMPANION_MQTT_H */
+diff --git a/main/companion/companion_mqtt_codec.c b/main/companion/companion_mqtt_codec.c
+new file mode 100644
+index 0000000..18222c8
+--- /dev/null
++++ b/main/companion/companion_mqtt_codec.c
+@@ -0,0 +1,101 @@
++#include "companion_mqtt_codec.h"
++
++#include <cJSON.h>
++#include <stdio.h>
++#include <string.h>
++
++#define CMD_MAX_TTL_S   300
++#define PAYLOAD_MAX_LEN 1024
++
++static void set_reason(char *reason, size_t cap, const char *text)
++{
++    if (reason != NULL && cap > 0) {
++        snprintf(reason, cap, "%s", text);
++    }
++}
++
++static bool get_string(const cJSON *root, const char *key,
++                       char *out, size_t cap, bool required)
++{
++    const cJSON *item = cJSON_GetObjectItem(root, key);
++    if (!cJSON_IsString(item) || item->valuestring == NULL) {
++        return !required;
++    }
++    snprintf(out, cap, "%s", item->valuestring);
++    return true;
++}
++
++bool companion_mqtt_parse_command(const char *payload, const char *device_id,
++                                  uint32_t received_ms,
++                                  companion_mqtt_cmd_t *out,
++                                  char *reason, size_t reason_cap)
++{
++    if (payload == NULL || out == NULL || device_id == NULL) {
++        set_reason(reason, reason_cap, "null");
++        return false;
++    }
++    if (strlen(payload) > PAYLOAD_MAX_LEN) {
++        set_reason(reason, reason_cap, "payload_too_large");
++        return false;
++    }
++
++    cJSON *root = cJSON_Parse(payload);
++    if (root == NULL) {
++        set_reason(reason, reason_cap, "invalid_json");
++        return false;
++    }
++
++    bool ok = false;
++    do {
++        const cJSON *version = cJSON_GetObjectItem(root, "schema_version");
++        if (!cJSON_IsNumber(version) || version->valueint != 1) {
++            set_reason(reason, reason_cap, "bad_schema_version");
++            break;
++        }
++
++        char dev[96] = {};
++        if (!get_string(root, "device_id", dev, sizeof(dev), true)) {
++            set_reason(reason, reason_cap, "missing_device_id");
++            break;
++        }
++        if (strcmp(dev, device_id) != 0) {
++            set_reason(reason, reason_cap, "device_mismatch");
++            break;
++        }
++
++        if (!get_string(root, "command_id", out->command_id,
++                        sizeof(out->command_id), true) ||
++            out->command_id[0] == '\0') {
++            set_reason(reason, reason_cap, "bad_command_id");
++            break;
++        }
++
++        const cJSON *ttl = cJSON_GetObjectItem(root, "ttl");
++        if (!cJSON_IsNumber(ttl) || ttl->valueint <= 0 ||
++            ttl->valueint > CMD_MAX_TTL_S) {
++            set_reason(reason, reason_cap, "bad_ttl");
++            break;
++        }
++        out->ttl_ms = (uint32_t)ttl->valueint * 1000;
++
++        if (!get_string(root, "action", out->action,
++                        sizeof(out->action), true)) {
++            set_reason(reason, reason_cap, "missing_action");
++            break;
++        }
++        if (strcmp(out->action, "request_status") != 0 &&
++            strcmp(out->action, "play_chime") != 0 &&
++            strcmp(out->action, "noop") != 0) {
++            set_reason(reason, reason_cap, "unsupported_action");
++            break;
++        }
++
++        get_string(root, "intent", out->intent, sizeof(out->intent), false);
++        get_string(root, "speech", out->speech, sizeof(out->speech), false);
++        out->received_ms = received_ms;
++        ok = true;
++    } while (0);
++
++    cJSON_Delete(root);
++    return ok;
++}
+diff --git a/main/companion/companion_mqtt_codec.h b/main/companion/companion_mqtt_codec.h
+new file mode 100644
+index 0000000..1186314
+--- /dev/null
++++ b/main/companion/companion_mqtt_codec.h
+@@ -0,0 +1,32 @@
++#ifndef COMPANION_MQTT_CODEC_H
++#define COMPANION_MQTT_CODEC_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    char command_id[65];
++    char action[33];
++    char intent[33];
++    char speech[97];
++    uint32_t ttl_ms;
++    uint32_t received_ms;
++} companion_mqtt_cmd_t;
++
++/* 纯协议校验：不依赖 FreeRTOS/网络，便于主机测试。
++ * 返回 false 时 reason 给出简短原因。 */
++bool companion_mqtt_parse_command(const char *payload, const char *device_id,
++                                  uint32_t received_ms,
++                                  companion_mqtt_cmd_t *out,
++                                  char *reason, size_t reason_cap);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* COMPANION_MQTT_CODEC_H */
+diff --git a/main/companion/companion_mqtt_transport.h b/main/companion/companion_mqtt_transport.h
+new file mode 100644
+index 0000000..6ab4ef3
+--- /dev/null
++++ b/main/companion/companion_mqtt_transport.h
+@@ -0,0 +1,19 @@
++#ifndef COMPANION_MQTT_TRANSPORT_H
++#define COMPANION_MQTT_TRANSPORT_H
++
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* 由 XiaoZhi MqttProtocol 实现；未连接或未初始化时返回 false。 */
++bool companion_mqtt_transport_publish(const char *topic, const char *payload, int qos);
++bool companion_mqtt_transport_subscribe(const char *topic, int qos);
++bool companion_mqtt_transport_is_connected(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* COMPANION_MQTT_TRANSPORT_H */
+diff --git a/main/companion/companion_service.cc b/main/companion/companion_service.cc
+index 97694e6..e0a86c1 100644
+--- a/main/companion/companion_service.cc
++++ b/main/companion/companion_service.cc
+@@ -21,6 +21,7 @@
+ #include "companion_audio.h"
+ #include "companion_event_log.h"
+ #include "companion_led.h"
++#include "companion_mqtt.h"
+ #include "event_queue.h"
+ #include "iic.h"
+ #include "motion_detect.h"
+@@ -355,10 +356,15 @@ static void companion_main_task(void *arg)
+     while (true) {
+         uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+         companion_snapshot_t snap = companion_status_get().snap;
++        companion_mqtt_sensor_view_t mqtt_view = {
++            snap.als, snap.ps, snap.gx, snap.gy, snap.gz,
++            snap.ap_ok, snap.qma_ok, snap.dark
++        };
+         event_t evt;
+         while (event_queue_recv(&evt, 0)) {
+             state_machine_on_event(evt);
+             companion_event_log_record(evt, now_ms, snap.als, snap.ps, snap.ap_ok);
++            companion_mqtt_publish_event(evt, now_ms, &mqtt_view);
+         }
+ 
+         DeviceState current = Application::GetInstance().GetDeviceState();
+@@ -372,6 +378,7 @@ static void companion_main_task(void *arg)
+                 state_machine_on_event(EVT_INTERACT_START);
+                 companion_event_log_record(EVT_INTERACT_START, now_ms,
+                                            snap.als, snap.ps, snap.ap_ok);
++                companion_mqtt_publish_event(EVT_INTERACT_START, now_ms, &mqtt_view);
+             }
+             if (current == kDeviceStateIdle &&
+                 (last_state == kDeviceStateListening ||
+@@ -380,6 +387,7 @@ static void companion_main_task(void *arg)
+                 state_machine_on_event(EVT_INTERACT_END);
+                 companion_event_log_record(EVT_INTERACT_END, now_ms,
+                                            snap.als, snap.ps, snap.ap_ok);
++                companion_mqtt_publish_event(EVT_INTERACT_END, now_ms, &mqtt_view);
+             }
+             last_state = current;
+         }
+@@ -396,6 +404,7 @@ static void companion_main_task(void *arg)
+             if (companion_state == STATE_SLEEPY) {
+                 companion_event_log_record(EVT_TIMER_SLEEPY, now_ms,
+                                            snap.als, snap.ps, snap.ap_ok);
++                companion_mqtt_publish_event(EVT_TIMER_SLEEPY, now_ms, &mqtt_view);
+             }
+             last_companion_state = companion_state;
+         }
+@@ -414,6 +423,7 @@ static void companion_main_task(void *arg)
+                      static_cast<unsigned>(event_queue_get_dropped_count()));
+         }
+ 
++        companion_mqtt_tick(now_ms, &mqtt_view);
+         companion_led_tick();
+         vTaskDelay(pdMS_TO_TICKS(100));
+     }
+@@ -447,6 +457,7 @@ extern "C" void companion_service_start(i2c_master_bus_handle_t bus)
+     event_queue_init();
+     companion_event_log_init();
+     state_machine_init();
++    companion_mqtt_init();
+ 
+     if (xTaskCreate(companion_sensor_task, "companion_sensor", 4096, nullptr, 3, nullptr) != pdPASS) {
+         ESP_LOGE(TAG, "创建传感器任务失败");
+diff --git a/main/protocols/mqtt_protocol.cc b/main/protocols/mqtt_protocol.cc
+index d8afe28..468ba8c 100644
+--- a/main/protocols/mqtt_protocol.cc
++++ b/main/protocols/mqtt_protocol.cc
+@@ -2,6 +2,8 @@
+ #include "board.h"
+ #include "application.h"
+ #include "settings.h"
++#include "companion/companion_mqtt.h"
++#include "companion/companion_mqtt_transport.h"
+ 
+ #include <esp_log.h>
+ #include <cctype>
+@@ -11,7 +13,10 @@
+ 
+ #define TAG "MQTT"
+ 
++static MqttProtocol* s_active_protocol = nullptr;
++
+ MqttProtocol::MqttProtocol() {
++    s_active_protocol = this;
+     event_group_handle_ = xEventGroupCreate();
+ 
+     // Initialize reconnect timer
+@@ -33,6 +38,9 @@ MqttProtocol::MqttProtocol() {
+ 
+ MqttProtocol::~MqttProtocol() {
+     ESP_LOGI(TAG, "MqttProtocol deinit");
++    if (s_active_protocol == this) {
++        s_active_protocol = nullptr;
++    }
+     if (reconnect_timer_ != nullptr) {
+         esp_timer_stop(reconnect_timer_);
+         esp_timer_delete(reconnect_timer_);
+@@ -87,6 +95,7 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
+     mqtt_->SetKeepAlive(keepalive_interval);
+ 
+     mqtt_->OnDisconnected([this]() {
++        companion_mqtt_on_disconnected();
+         if (on_disconnected_ != nullptr) {
+             on_disconnected_();
+         }
+@@ -99,9 +108,14 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
+             on_connected_();
+         }
+         esp_timer_stop(reconnect_timer_);
++        companion_mqtt_on_connected();
+     });
+ 
+     mqtt_->OnMessage([this](const std::string& topic, const std::string& payload) {
++        if (companion_mqtt_on_message(topic.c_str(), payload.c_str())) {
++            UpdateLastIncomingTime();
++            return;
++        }
+         cJSON* root = cJSON_Parse(payload.c_str());
+         if (root == nullptr) {
+             ESP_LOGE(TAG, "Failed to parse json message %s", payload.c_str());
+@@ -157,9 +171,10 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
+ }
+ 
+ bool MqttProtocol::SendText(const std::string& text) {
+-    if (publish_topic_.empty()) {
++    if (publish_topic_.empty() || mqtt_ == nullptr) {
+         return false;
+     }
++    std::lock_guard<std::mutex> lock(publish_mutex_);
+     if (!mqtt_->Publish(publish_topic_, text)) {
+         ESP_LOGE(TAG, "Failed to publish message: %s", text.c_str());
+         SetError(Lang::Strings::SERVER_ERROR);
+@@ -168,6 +183,49 @@ bool MqttProtocol::SendText(const std::string& text) {
+     return true;
+ }
+ 
++bool MqttProtocol::PublishRaw(const std::string& topic, const std::string& payload, int qos) {
++    if (mqtt_ == nullptr || !mqtt_->IsConnected()) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(publish_mutex_);
++    return mqtt_->Publish(topic, payload, qos);
++}
++
++bool MqttProtocol::SubscribeRaw(const std::string& topic, int qos) {
++    if (mqtt_ == nullptr || !mqtt_->IsConnected()) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lock(publish_mutex_);
++    return mqtt_->Subscribe(topic, qos);
++}
++
++bool MqttProtocol::IsConnectedRaw() const {
++    return mqtt_ != nullptr && mqtt_->IsConnected();
++}
++
++extern "C" bool companion_mqtt_transport_publish(const char *topic,
++                                                  const char *payload,
++                                                  int qos)
++{
++    if (s_active_protocol == nullptr || topic == nullptr || payload == nullptr) {
++        return false;
++    }
++    return s_active_protocol->PublishRaw(topic, payload, qos);
++}
++
++extern "C" bool companion_mqtt_transport_subscribe(const char *topic, int qos)
++{
++    if (s_active_protocol == nullptr || topic == nullptr) {
++        return false;
++    }
++    return s_active_protocol->SubscribeRaw(topic, qos);
++}
++
++extern "C" bool companion_mqtt_transport_is_connected(void)
++{
++    return s_active_protocol != nullptr && s_active_protocol->IsConnectedRaw();
++}
++
+ namespace {
+ /* 校验十六进制字符串长度与字符合法性，避免非法 hello 被静默解码。 */
+ bool IsValidHex(const char* s, size_t expected_len) {
+diff --git a/main/protocols/mqtt_protocol.h b/main/protocols/mqtt_protocol.h
+index 59d7f06..12db1e8 100644
+--- a/main/protocols/mqtt_protocol.h
++++ b/main/protocols/mqtt_protocol.h
+@@ -32,10 +32,16 @@ public:
+     void CloseAudioChannel() override;
+     bool IsAudioChannelOpened() const override;
+ 
++    /* 陪伴业务 MQTT 传输：复用同一条 MQTT 连接，不改变 XiaoZhi 控制 topic。 */
++    bool PublishRaw(const std::string& topic, const std::string& payload, int qos);
++    bool SubscribeRaw(const std::string& topic, int qos);
++    bool IsConnectedRaw() const;
++
+ private:
+     EventGroupHandle_t event_group_handle_;
+ 
+     std::string publish_topic_;
++    std::mutex publish_mutex_;
+ 
+     /* 锁顺序固定为 channel_mutex_ -> aes_mutex_，禁止反向获取。
+      * channel_mutex_ 保护 udp_ 的创建/发送/销毁；

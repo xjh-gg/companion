@@ -1,0 +1,41 @@
+# 编译产物
+build/
+build_log.txt
+build_ninja_stderr.txt
+build_ninja_stdout.txt
+managed_components/
+
+# 含本地敏感凭据（WiFi 密码、MQTT broker）的生成配置，不入库
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.bak
+
+# 本地交付证据：固件、日志、源码快照、压缩包，不提交
+backups/
+
+# 本机工具与缓存
+.trae/
+.cache/
+.vscode/
+.clangd
+
+# 主机测试可执行文件/中间产物
+tests/host/*.exe
+tests/host/*.o
+
+# 本地个人网络/凭据痕迹不提交（防御性规则）
+*.pem
+*.key
+*.crt
+*.p12
+
+# 独立业务 MQTT：Broker 凭据与运行日志，绝不入库
+tools/mqtt_broker/.secrets.json
+tools/mqtt_broker/passwd
+tools/mqtt_broker/*.log
+cloud/*.log
+cloud/ai_config.json
+cloud/.env
+cloud/state/
+cloud/__pycache__/
+main/companion/companion_mqtt_business_config.h

@@ -1,0 +1,111 @@
+﻿=== state machine tests ===
+I COMPANION_STATE: 状态机初始化完成，当前状态: 待机
+PASS 上电进入待机
+PASS 待机犯困剩余时间=60分钟
+PASS 初始状态持续时间=0
+I COMPANION_STATE: 状态迁移: 待机 -> 互动中 (事件: 开始语音对话, 原状态持续 500 ms)
+PASS 待机收到交互开始进入互动中
+PASS 交互事件记录为最近事件
+PASS 进入互动后状态持续时间=0
+PASS 互动状态持续时间按tick增长
+PASS 重复交互开始保持互动中
+PASS 重复交互开始不重复 LED 请求
+PASS 重复交互开始不重复提醒
+PASS 交互两分钟仍未进入犯困
+PASS 交互期间无提醒请求
+PASS 交互期间犯困已计时长=0
+I COMPANION_STATE: 状态迁移: 互动中 -> 被关注 (事件: 对话结束, 原状态持续 125000 ms)
+PASS 交互结束进入被关注
+PASS 被关注29999ms仍保持
+I COMPANION_STATE: 被关注 30s 无操作，回到待机
+I COMPANION_STATE: 状态迁移: 被关注 -> 待机 (事件: 无, 原状态持续 30000 ms)
+PASS 被关注满30s回到待机
+PASS 回到待机后犯困计时清零
+PASS 待机3599s未进入犯困
+PASS 待机3599s剩余1s
+I COMPANION_STATE: 犯困定时到（60 分钟）
+I COMPANION_STATE: 状态迁移: 待机 -> 犯困 (事件: 犯困定时到, 原状态持续 3600000 ms)
+PASS 待机3600s进入犯困
+PASS 进入犯困请求提醒一次
+PASS 犯困态持续10分钟不重复提醒
+I COMPANION_STATE: 状态迁移: 犯困 -> 互动中 (事件: 开始语音对话, 原状态持续 600000 ms)
+PASS 犯困收到交互开始退出犯困
+I COMPANION_STATE: 状态迁移: 互动中 -> 被关注 (事件: 对话结束, 原状态持续 0 ms)
+I COMPANION_STATE: 被关注 30s 无操作，回到待机
+I COMPANION_STATE: 状态迁移: 被关注 -> 待机 (事件: 无, 原状态持续 30000 ms)
+PASS 犯困退出后30s正常回待机
+I COMPANION_STATE: 犯困定时到（60 分钟）
+I COMPANION_STATE: 状态迁移: 待机 -> 犯困 (事件: 犯困定时到, 原状态持续 3600000 ms)
+PASS 再次达到犯困阈值
+PASS 第二次进入犯困再次请求提醒
+I COMPANION_STATE: 状态迁移: 犯困 -> 被关注 (事件: 手靠近, 原状态持续 0 ms)
+PASS 犯困收到手靠近进入被关注
+PASS 非法事件保持被关注
+I COMPANION_STATE: 被关注 30s 无操作，回到待机
+I COMPANION_STATE: 状态迁移: 被关注 -> 待机 (事件: 无, 原状态持续 30000 ms)
+PASS tick回绕后被关注仍按30s超时
+I COMPANION_STATE: 状态机初始化完成，当前状态: 待机
+I COMPANION_STATE: 犯困定时到（60 分钟）
+I COMPANION_STATE: 状态迁移: 待机 -> 犯困 (事件: 犯困定时到, 原状态持续 3600000 ms)
+W COMPANION_STATE: 犯困提醒未受理（音频忙或设备非空闲）
+PASS 提醒被拒仍进入犯困
+I COMPANION_STATE: 状态迁移: 犯困 -> 互动中 (事件: 开始语音对话, 原状态持续 0 ms)
+PASS 提醒被拒后交互仍可退出犯困
+I COMPANION_STATE: 状态机初始化完成，当前状态: 待机
+I COMPANION_STATE: 状态迁移: 待机 -> 被关注 (事件: 拿起, 原状态持续 10000 ms)
+PASS 活动事件刷新最近活动时间
+PASS 活动时间按单调 tick 增长
+=== event queue tests ===
+PASS 队列初始化成功
+PASS 重复初始化幂等
+PASS EVT_NONE 被忽略
+PASS EVT_NONE 不入队
+PASS 队列容量为8且可填满
+W EVENT_QUEUE: 事件队列满：累计丢弃 1/9（事件=3）
+PASS 队列满返回超时
+PASS 丢弃计数为1
+PASS 队列满时深度不变
+PASS 按序取出8个事件
+PASS 取出后队列为空
+PASS 未知事件可安全入队
+PASS 未知事件可安全取出
+PASS 空指针接收被拒绝
+=== event log tests ===
+PASS 事件日志初始为空
+PASS 事件日志初始累计为0
+PASS 事件日志累计30条
+PASS 事件日志环形容量24
+PASS 按限制返回8条
+PASS 最新事件在前
+PASS 最新事件携带ALS值
+PASS 第8条为第23个事件
+PASS 最多复制24条
+PASS 最旧保留事件为第7个
+PASS EVT_NONE不入历史
+PASS 无效数据标志被保留
+PASS 事件类型正确
+PASS 复制0条返回0
+PASS 空指针复制返回0
+PASS 复制请求超过容量按24条截断
+PASS 事件按序号严格倒序返回
+=== motion detect tests ===
+PASS 运动检测器创建成功
+PASS 静止校准期间不误报
+PASS z分量骤减触发拿起
+PASS 拿起锁定期间不重复触发
+PASS 锁定期满后不再重复上报
+PASS 重新校准后可再次拿起
+PASS 方向反复翻转触发摇晃
+PASS 回绕前拿起正常触发
+PASS 回绕后锁定期正确结束
+PASS 回绕后可重新校准并触发拿起
+
+RESULT: PASS=73 FAIL=0
+PASS 初始无错误标志
+PASS SetError 置位错误标志
+PASS 最近 60s 有下行消息不超时
+E Protocol: Channel timeout 121 seconds
+PASS 121s 无下行消息判定超时
+PASS 更新时间后立即恢复不超时
+
+RESULT: PASS=5 FAIL=0

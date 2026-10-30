@@ -1,0 +1,9 @@
+user companion-device
+topic write companion/+/event
+topic write companion/+/status
+topic read companion/+/command
+
+user companion-cloud
+topic read companion/+/event
+topic read companion/+/status
+topic write companion/+/command

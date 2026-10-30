@@ -1,0 +1,5 @@
+paho-mqtt>=2.0
+# FastMCP 在 mcp 2.x 中改名为 MCPServer，官方桥接示例使用 1.x API
+mcp>=1.8.1,<2
+websockets>=11.0.3
+python-dotenv>=1.0.0
