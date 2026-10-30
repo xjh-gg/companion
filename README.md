@@ -303,6 +303,7 @@ python -m unittest test_smartguard_state -v      # 15 项
 
 | 文档 | 内容 |
 |---|---|
+| [docs/文档索引.md](docs/文档索引.md) | 全部文档导航：按用途分组，标注时间与状态 |
 | [docs/需求分析.md](docs/需求分析.md) | 需求与场景定义 |
 | [docs/软件架构.md](docs/软件架构.md) | 模块划分与任务设计 |
 | [docs/状态机设计.md](docs/状态机设计.md) | 状态、事件与迁移规则 |
