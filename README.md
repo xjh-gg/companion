@@ -1,11 +1,45 @@
 # Companion 桌面情感陪伴终端
 
+![MCU](https://img.shields.io/badge/MCU-ESP32--S3-E7352C)
+![Framework](https://img.shields.io/badge/ESP--IDF-v6.1-blue)
+![RTOS](https://img.shields.io/badge/RTOS-FreeRTOS-green)
+![Language](https://img.shields.io/badge/Language-C%20%2F%20Python-lightgrey)
+![Host tests](https://img.shields.io/badge/host%20tests-98%20passed-brightgreen)
+![Status](https://img.shields.io/badge/status-phase%202%20frozen-orange)
+
 基于 ESP32-S3、FreeRTOS 与 XiaoZhi 2.0.3 的桌面情感陪伴设备。设备通过 QMA6100P、AP3216C 和按键感知用户行为，由本地状态机驱动 LED 与定时提醒，并通过 XiaoZhi 完成语音对话与只读 MCP 状态查询。
 
 > **当前状态（2026-10-23）**：阶段二收尾，功能冻结。
 > 最新验收固件：`xiaozhi_concurrency_fix_20261023.bin`，2,748,256 字节，SHA-256 `237F6E753C34158A7488DBE38ACCC9CE82CA62DE52C381874AB32D4A224020CF`（固件与日志保留在本地 `backups/`，不随仓库提交）。
 > 本轮 MQTT 业务联调结论：现有 XiaoZhi Broker 认证与业务 topic 订阅可用，但发布业务 topic 后 Broker 立即断开；已完成设备侧实现与熔断保护，设备已回滚到稳定固件。最新业务构建：`xiaozhi_mqtt_circuit_breaker2_20261023.bin`，2,756,800 字节，SHA-256 `E9000377BF8FB8E46934254E7AF126A65B663960E16B1934CE5E9D2A4785CB38`（未运行）。
 > **重要说明**：本工作区是“项目资料 + 自研模块 + 交付补丁”仓库，不是完整的 XiaoZhi 固件源码仓库。当前产品固件基于独立的 XiaoZhi 2.0.3 源码树，应用 `patches/` 中的补丁构建；工作区根目录的 `main/` 与 `components/` 是早期自研原型，仅作参考。
+
+## 亮点
+
+- **事件抽象而非情绪判定**：传感器读数先转成“拿起、摇晃、手靠近、按键、长时间无互动”等本地事件，由状态机决定灯效与提醒，不直接把读数当作情绪结论。
+- **本地闭环**：网络断开时，传感器采集、状态机与 LED 灯效仍独立运行；语音能力由云端 XiaoZhi 补充，而不是替代本地逻辑。
+- **只读 MCP 查询**：`self.companion.get_status`、`self.companion.get_recent_events` 让语音端可以问“现在状态如何”，不暴露写操作。
+- **业务 MQTT 与语音通道解耦**：设备侧独立 `esp_mqtt_client` 上报事件/状态，默认关闭联调，并带发布熔断保护，避免业务通道故障拖垮语音链路。
+- **可验证的交付**：98 项主机测试（C 82 / C++ 5 / MQTT 协议 11）、云端场景引擎 36 项、SmartGuard MCP 15 项测试通过。
+- **诚实的能力边界**：未验证项（扬声器人耳出声、真实 AI 服务、MCP 外部调用）在文中明确标注，不把“注册成功”写成“端到端通过”。
+
+## 目录
+
+- [1. 项目简介](#1-项目简介)
+- [2. 主要硬件](#2-主要硬件)
+- [3. 软件架构](#3-软件架构)
+- [4. 已实现功能](#4-已实现功能)
+- [5. 状态机与交互](#5-状态机与交互)
+- [6. XiaoZhi 与 MCP](#6-xiaozhi-与-mcp)
+- [7. 构建环境](#7-构建环境)
+- [8. 测试](#8-测试)
+- [9. 配置与安全](#9-配置与安全)
+- [10. 已知限制](#10-已知限制)
+- [11. 目录结构](#11-目录结构)
+- [12. 后续规划](#12-后续规划)
+- [13. 许可证与第三方代码](#13-许可证与第三方代码)
+- [快速开始](#快速开始)
+- [文档索引](#文档索引)
 
 ## 1. 项目简介
 
@@ -25,19 +59,17 @@
 
 ## 3. 软件架构
 
-```text
-QMA6100P / AP3216C / KEY0-3
-        │ 50ms 轮询
-        ▼
-companion_sensor_task
-        │ 事件（拿起/摇晃/手靠近/暗光/按键）
-        ▼
-事件队列（深度 8） → companion_main_task → 状态机（5 状态）
-        │                         │
-        │                         ├─ GpioLed 灯效（GPIO1）
-        │                         └─ 犯困提醒（OGG_POPUP）
-        ├─ 事件历史（24 条，环形）
-        └─ MCP get_status / get_recent_events（只读）
+```mermaid
+flowchart LR
+    S["QMA6100P / AP3216C / KEY0-3<br/>50ms 轮询"] --> T["companion_sensor_task"]
+    T -->|"本地事件"| Q["事件队列<br/>深度 8"]
+    Q --> M["companion_main_task<br/>状态机（5 状态）"]
+    M --> LED["GpioLed 灯效<br/>GPIO1"]
+    M --> REM["犯困提醒<br/>OGG_POPUP"]
+    M --> H["事件历史<br/>24 条环形"]
+    H --> MCP["MCP 只读工具<br/>get_status / get_recent_events"]
+    M --> MQTT["companion_mqtt<br/>业务 topic 上报"]
+    X["XiaoZhi 2.0.3<br/>语音 / 控制 MQTT / UDP 音频"] -.-> MCP
 ```
 
 - 产品固件主体：XiaoZhi 2.0.3 + `main/companion/` 自研模块。
@@ -233,12 +265,12 @@ companion/
 ├── docs/                       # 需求、架构、验收、审计文档
 │   ├── phase2_acceptance_20261022/
 │   └── MQTT_CLOUD_AI_AUDIT.md
-├── cloud/                      # 本地 MQTT 消费者、场景引擎与单元测试
-├── tests/host/                 # 主机测试与桩
-├── patches/                    # 发布用补丁（产品固件构建所需）
-├── backups/delivery_20261022/  # 本地交付证据：固件、日志、校验值（不提交）
-├── tools/mqtt_broker/          # 独立业务 broker 配置（凭据文件不提交）
-└── tools/                      # 构建与音频转换脚本
+├── cloud/                       # 本地 MQTT 消费者、场景引擎与单元测试
+├── tests/host/                  # 主机测试与桩
+├── patches/                     # 发布用补丁（产品固件构建所需）
+├── backups/delivery_20261022/   # 本地交付证据：固件、日志、校验值（不提交）
+├── tools/mqtt_broker/           # 独立业务 broker 配置（凭据文件不提交）
+└── tools/                       # 构建与音频转换脚本
 ```
 
 ## 12. 后续规划
@@ -251,3 +283,33 @@ companion/
 ## 13. 许可证与第三方代码
 
 本项目基于 XiaoZhi 2.0.3 及其依赖，第三方代码与许可证归各自上游项目所有。发布时需保留上游 `LICENSE`、版权声明与依赖许可信息；本项目未重新授权第三方代码。
+
+## 快速开始
+
+```powershell
+# 1) 主机测试（无需硬件，需已应用补丁的 XiaoZhi 源码树）
+powershell -ExecutionPolicy Bypass -File tests/host/run_tests.ps1 `
+  -SourceRoot <已应用补丁的 XiaoZhi 源码树>
+
+# 2) 云端场景引擎与 MCP 状态机测试
+cd cloud
+python -m unittest test_companion_ai -v          # 36 项
+python -m unittest test_smartguard_state -v      # 15 项
+```
+
+产品固件构建与烧录见 [7.1 产品固件](#71-产品固件推荐)；业务 MQTT 联调与云端消费者见 [8.1](#81-云端消费者与场景判断) 与 [8.2](#82-小智-mcp-只读接入)。
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [docs/需求分析.md](docs/需求分析.md) | 需求与场景定义 |
+| [docs/软件架构.md](docs/软件架构.md) | 模块划分与任务设计 |
+| [docs/状态机设计.md](docs/状态机设计.md) | 状态、事件与迁移规则 |
+| [docs/EVENT_MODEL.md](docs/EVENT_MODEL.md) | 事件模型与字段定义 |
+| [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md) | MCP 只读工具说明 |
+| [docs/MQTT_CLOUD_AI_AUDIT.md](docs/MQTT_CLOUD_AI_AUDIT.md) | MQTT、云端消费者与 AI 能力审计 |
+| [docs/TEST_REPORT.md](docs/TEST_REPORT.md) | 测试范围与结果 |
+| [docs/phase2_acceptance_20261022/PHASE2_FINAL_ACCEPTANCE_REPORT.md](docs/phase2_acceptance_20261022/PHASE2_FINAL_ACCEPTANCE_REPORT.md) | 阶段二最终验收 |
+| [docs/PROJECT_CLOSURE_REPORT.md](docs/PROJECT_CLOSURE_REPORT.md) | 项目收尾与状态冻结说明 |
+| [docs/GITHUB_RELEASE_CHECKLIST.md](docs/GITHUB_RELEASE_CHECKLIST.md) | 公开发布前检查项 |
